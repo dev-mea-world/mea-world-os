@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,12 @@ const TASK_TWO = "22222222-2222-4222-8222-222222222222";
 const TASK_THREE = "33333333-3333-4333-8333-333333333333";
 const RUN_ONE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const RUN_TWO = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const canApplyHostSandbox = process.platform === "darwin" && spawnSync(
+  "/usr/bin/sandbox-exec",
+  ["-p", "(version 1) (allow default)", "/usr/bin/true"],
+  { stdio: "ignore" }
+).status === 0;
+const hostSandboxIt = canApplyHostSandbox ? it : it.skip;
 
 function git(cwd: string, arguments_: string[]): string {
   return execFileSync("git", arguments_, {
@@ -75,7 +81,7 @@ describe("automatic Git publisher", () => {
     ));
   });
 
-  it("commits and verifies a task worktree without touching dirty main", async () => {
+  hostSandboxIt("commits and verifies a task worktree without touching dirty main", async () => {
     const fixture = await createRepository();
     temporaryDirectories.push(fixture.temporaryDirectory);
     const originalMain = git(fixture.repository, ["rev-parse", "HEAD"]);
@@ -196,7 +202,7 @@ describe("automatic Git publisher", () => {
     });
   });
 
-  it("rejects a non-fast-forward race without force", async () => {
+  hostSandboxIt("rejects a non-fast-forward race without force", async () => {
     const fixture = await createRepository();
     temporaryDirectories.push(fixture.temporaryDirectory);
     const first = publisher(fixture.repository);
@@ -270,7 +276,7 @@ describe("automatic Git publisher", () => {
     await expect(readFile(stalePath, "utf8")).resolves.toContain("crashed run");
   });
 
-  it("runs validation without project secrets, host reads, outside writes, or network", async () => {
+  hostSandboxIt("runs validation without project secrets, host reads, outside writes, or network", async () => {
     const fixture = await createRepository();
     temporaryDirectories.push(fixture.temporaryDirectory);
     const hostSecretPath = join(fixture.temporaryDirectory, "host-secret.txt");

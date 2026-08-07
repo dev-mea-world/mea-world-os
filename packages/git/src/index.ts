@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   readlink,
   realpath,
   rm,
@@ -597,6 +598,7 @@ export class RepositoryPublisher {
     const initialFiles = await this.changedFiles(input.workspace.path);
     if (initialFiles.length === 0) return { status: "noop", headSha };
     await this.assertChangePolicy(input.workspace.path, initialFiles);
+    await this.assertWorkingTreeContentPolicy(input.workspace.path, initialFiles);
 
     const validationDirectory = resolve(
       this.stateDirectory,
@@ -657,6 +659,7 @@ export class RepositoryPublisher {
     const finalFiles = await this.changedFiles(input.workspace.path);
     if (finalFiles.length === 0) return { status: "noop", headSha };
     await this.assertChangePolicy(input.workspace.path, finalFiles);
+    await this.assertWorkingTreeContentPolicy(input.workspace.path, finalFiles);
     await this.git([
       "add",
       "--all",
@@ -847,6 +850,38 @@ export class RepositoryPublisher {
     const rawDiff = await this.git(["diff", "--raw", "HEAD", "--"], workspacePath);
     if (/(?:^|\s)160000(?:\s|$)/m.test(rawDiff.stdout)) {
       throw new RepositoryPublisherError("git_gitlink_changed", false);
+    }
+  }
+
+  private async assertWorkingTreeContentPolicy(
+    workspacePath: string,
+    paths: string[]
+  ): Promise<void> {
+    for (const path of paths) {
+      const absolutePath = resolve(workspacePath, path);
+      if (!isPathWithin(workspacePath, absolutePath)) {
+        throw new RepositoryPublisherError("git_invalid_changed_path", false);
+      }
+      let metadata;
+      try {
+        metadata = await lstat(absolutePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (metadata.isSymbolicLink()) {
+        throw new RepositoryPublisherError("git_symlink_changed", false);
+      }
+      if (!metadata.isFile() || metadata.size > 12 * 1024 * 1024) {
+        throw new RepositoryPublisherError("git_changed_file_unscannable", false);
+      }
+      const content = (await readFile(absolutePath)).toString("utf8");
+      if (path.endsWith(".env.example") && envExampleHasValues(content)) {
+        throw new RepositoryPublisherError("git_env_example_contains_value", false);
+      }
+      if (containsLikelySecret(content)) {
+        throw new RepositoryPublisherError("git_likely_secret_detected", false);
+      }
     }
   }
 
