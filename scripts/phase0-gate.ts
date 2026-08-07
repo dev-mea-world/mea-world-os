@@ -87,13 +87,16 @@ async function main(): Promise<void> {
     const originUrl = gitValue(["remote", "get-url", "origin"]);
     const localHead = gitValue(["rev-parse", "HEAD"]);
     const upstreamHead = gitValue(["rev-parse", "@{upstream}"]);
-    const remoteMainOutput = gitValue(["ls-remote", "--heads", "origin", "refs/heads/main"]);
-    const remoteMainHead = remoteMainOutput?.split(/\s+/)[0] ?? null;
+    const currentBranch = gitValue(["branch", "--show-current"]);
+    const remoteBranchOutput = currentBranch
+      ? gitValue(["ls-remote", "--heads", "origin", `refs/heads/${currentBranch}`])
+      : null;
+    const remoteBranchHead = remoteBranchOutput?.split(/\s+/)[0] ?? null;
     const githubUpstreamReady = Boolean(
       originUrl?.match(/github\.com[:/]/)
       && localHead
       && localHead === upstreamHead
-      && localHead === remoteMainHead
+      && localHead === remoteBranchHead
     );
     const gitPublication = gitPublications[0];
     const publicationRemoteOutput = gitPublication
@@ -134,8 +137,11 @@ async function main(): Promise<void> {
         ? { status: "PASS", evidence: `${Number(notion.sampled_count)} bounded object(s) sampled` }
         : { status: "BLOCKED", evidence: `Runtime Notion sample unavailable (${notion?.error_code ?? "not_configured"})` },
       github_push: githubUpstreamReady
-        ? { status: "PASS", evidence: `Live GitHub main contains local HEAD ${localHead?.slice(0, 8)}` }
-        : { status: "BLOCKED", evidence: "Live GitHub main does not contain the local HEAD" },
+        ? {
+            status: "PASS",
+            evidence: `Live GitHub branch ${currentBranch} contains local HEAD ${localHead?.slice(0, 8)}`
+          }
+        : { status: "BLOCKED", evidence: "Live GitHub upstream does not contain the local HEAD" },
       automatic_git_publication: gitPublication?.commit_sha === publicationRemoteHead
         ? {
             status: "PASS",

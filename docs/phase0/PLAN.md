@@ -11,6 +11,7 @@ Out of scope: exhaustive Notion traversal, semantic extraction, vector search, r
 | Gate | Evidence required |
 | --- | --- |
 | GitHub push | `origin` resolves to the intended repository and a pushed commit is visible remotely. |
+| Automatic Git publication | A `repo.update` task changes only its isolated worktree, passes tests/typecheck, records the publication saga, and has the exact commit SHA visible on a non-protected remote branch. |
 | Notion read | A bounded SDK search returns at least one accessible object; no write API is called. |
 | Vercel reachability | Production HTTPS `/api/health` returns a healthy/degraded structured response. |
 | Dashboard auth | Invalid codes are rejected/throttled, valid code creates an HTTP-only signed cookie, logout clears it, unauthenticated mutations fail. |
