@@ -161,6 +161,7 @@ export class GitUpdateCoordinator {
         } else {
           workspace = await this.publisher.prepareWorkspace({
             taskId: input.task.id,
+            runId: input.runId,
             baseSha: publication.baseSha
           });
           await this.checkpoint(input, {
