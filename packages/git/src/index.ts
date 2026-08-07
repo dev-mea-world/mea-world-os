@@ -284,9 +284,30 @@ export class RepositoryPublisher {
     this.remote = config.remote;
     this.targetBranch = config.targetBranch;
     this.baseBranch = config.baseBranch;
+    const typecheckProjects = [
+      "packages/codex",
+      "packages/domain",
+      "packages/git",
+      "packages/notion",
+      "packages/security",
+      "packages/orchestration",
+      "packages/approvals",
+      "packages/observability",
+      "packages/db",
+      "apps/worker",
+      "apps/web"
+    ];
     this.validationCommands = config.validationCommands ?? [
-      { name: "tests", executable: "pnpm", args: ["test"] },
-      { name: "typecheck", executable: "pnpm", args: ["typecheck"] }
+      {
+        name: "tests",
+        executable: resolve(this.repositoryRoot, "node_modules/.bin/vitest"),
+        args: ["run"]
+      },
+      ...typecheckProjects.map((project) => ({
+        name: `typecheck_${project.replaceAll("/", "_")}`,
+        executable: resolve(this.repositoryRoot, "node_modules/.bin/tsc"),
+        args: ["-p", `${project}/tsconfig.json`, "--noEmit"]
+      }))
     ];
     this.commandTimeoutMs = config.commandTimeoutMs ?? 10 * 60_000;
   }
