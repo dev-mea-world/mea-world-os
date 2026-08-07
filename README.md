@@ -19,7 +19,7 @@ The worker and web app must share `WORKER_ID` and `WORKER_SECRET`. The web app a
 
 ## Automatic repository updates
 
-The worker can publish a `repo.update` task automatically when `GIT_AUTO_PUBLISH_ENABLED=true`. The update runs in a worker-owned Git worktree, never in the human checkout. Codex receives write access only to that worktree and no tool-network access; the host worker then blocks sensitive files and likely secrets, runs `pnpm test` and `pnpm typecheck`, creates an attributable commit, and pushes it without force.
+The worker can publish a `repo.update` task automatically when `GIT_AUTO_PUBLISH_ENABLED=true`. Every run uses its own worker-owned Git worktree, never the human checkout, so a retry cannot inherit files left by a failed attempt. Codex receives write access only to that worktree and no tool-network access. The host worker then blocks sensitive files and likely secrets, runs the full test suite and all project typechecks in a second macOS sandbox with no network or host credentials, creates an attributable commit, and pushes it without force.
 
 The default remote target is `origin` branch `automation/phase0-updates`. `main` and `master` are rejected as automatic targets. A task is successful only after the worker reads the remote ref back and verifies its commit SHA. Commit/push progress is persisted in PostgreSQL so an interrupted attempt can reconcile instead of publishing a duplicate.
 
@@ -32,6 +32,8 @@ pnpm loop:enqueue-update
 ```
 
 The same prompt is deduplicated automatically. Set `LOOP_UPDATE_DEDUPE_KEY` when a caller needs an explicit stable idempotency key.
+
+The validation boundary uses macOS Seatbelt at `/usr/bin/sandbox-exec`. Run the worker from a normal terminal or host service; launching it inside another Seatbelt sandbox makes validation fail closed because macOS does not permit nested sandbox application.
 
 ## Verification
 

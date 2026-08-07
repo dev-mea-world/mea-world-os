@@ -3,8 +3,10 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   readlink,
   realpath,
+  rm,
   symlink,
   unlink
 } from "node:fs/promises";
@@ -14,7 +16,9 @@ const GIT_SHA = /^[a-f0-9]{40,64}$/;
 const TASK_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const VALIDATION_NAME = /^[a-z0-9_]{1,64}$/;
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024;
+const SANDBOX_EXECUTABLE = "/usr/bin/sandbox-exec";
 
 const ENVIRONMENT_KEYS = new Set([
   "HOME",
@@ -64,16 +68,28 @@ interface CommandFailure extends Error {
   stderr?: string;
 }
 
+interface DependencyLink {
+  source: string;
+  destination: string;
+  destinationParent: string;
+  mode: "mirror" | "symlink";
+}
+
 function runFile(
   executable: string,
   arguments_: string[],
-  options: { cwd: string; timeoutMs: number; maxBuffer?: number }
+  options: {
+    cwd: string;
+    timeoutMs: number;
+    maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
+  }
 ): Promise<CommandResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     execFile(executable, arguments_, {
       cwd: options.cwd,
       encoding: "utf8",
-      env: commandEnvironment(),
+      env: options.env ?? commandEnvironment(),
       timeout: options.timeoutMs,
       maxBuffer: options.maxBuffer ?? MAX_COMMAND_OUTPUT
     }, (error, stdout, stderr) => {
@@ -87,6 +103,99 @@ function runFile(
       resolvePromise({ stdout, stderr });
     });
   });
+}
+
+function validationEnvironment(home: string, temporaryDirectory: string): NodeJS.ProcessEnv {
+  return {
+    CI: "1",
+    GCM_INTERACTIVE: "Never",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    HOME: home,
+    LANG: "en_US.UTF-8",
+    LOGNAME: "meaworld-loop",
+    NODE_DISABLE_COMPILE_CACHE: "1",
+    NO_COLOR: "1",
+    PATH: `${dirname(process.execPath)}:/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
+    TEMP: temporaryDirectory,
+    TMP: temporaryDirectory,
+    TMPDIR: temporaryDirectory,
+    TZ: "UTC",
+    USER: "meaworld-loop",
+    __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0"
+  };
+}
+
+function sandboxString(value: string): string {
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    throw new RepositoryPublisherError("git_invalid_sandbox_path", false);
+  }
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function sandboxProfile(
+  workspacePath: string,
+  validationDirectory: string,
+  readableRoots: string[]
+): string {
+  const readRoots = [...new Set([
+    "/System",
+    "/Library/Developer/CommandLineTools",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/sbin",
+    "/usr/share",
+    "/bin",
+    "/sbin",
+    "/etc/group",
+    "/etc/localtime",
+    "/etc/passwd",
+    "/private/etc/group",
+    "/private/etc/localtime",
+    "/private/etc/passwd",
+    "/private/var/db/timezone",
+    "/dev/fd",
+    "/dev/null",
+    "/dev/random",
+    "/dev/stderr",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/urandom",
+    dirname(dirname(process.execPath)),
+    workspacePath,
+    validationDirectory,
+    ...readableRoots
+  ])];
+  const reads = readRoots.flatMap((path) => [
+    `(literal ${sandboxString(path)})`,
+    `(subpath ${sandboxString(path)})`
+  ]).join(" ");
+  const ancestorMetadata = [...new Set(readRoots.flatMap((path) => {
+    const ancestors: string[] = [];
+    let current = dirname(path);
+    while (current !== "/") {
+      ancestors.push(current);
+      current = dirname(current);
+    }
+    return ancestors;
+  }))].map((path) => `(literal ${sandboxString(path)})`).join(" ");
+  const workspace = sandboxString(workspacePath);
+  const validation = sandboxString(validationDirectory);
+  return [
+    "(version 1)",
+    "(deny default)",
+    "(allow process*)",
+    "(allow sysctl-read)",
+    "(allow signal (target self))",
+    "(allow signal (target children))",
+    "(allow ipc-posix-shm)",
+    '(allow mach-lookup (global-name "com.apple.system.notification_center") (global-name "com.apple.system.opendirectoryd.libinfo"))',
+    '(allow file-read-data (literal "/"))',
+    `(allow file-read-metadata (literal "/") ${ancestorMetadata})`,
+    `(allow file-read* ${reads})`,
+    `(allow file-write* (literal ${workspace}) (subpath ${workspace}) (literal ${validation}) (subpath ${validation}) (literal "/dev/null"))`
+  ].join(" ");
 }
 
 function isPathWithin(parent: string, child: string): boolean {
@@ -192,6 +301,7 @@ function sensitivePath(path: string): boolean {
     || normalized.split("/").includes("..")
     || normalized === ".phase0"
     || normalized.startsWith(".phase0/")
+    || normalized === ".gitattributes"
     || normalized === ".gitmodules"
   ) return true;
   if (name.startsWith(".env") && name !== ".env.example") return true;
@@ -243,6 +353,7 @@ export interface RepositoryPublisherConfig {
 
 export interface RepositoryWorkspace {
   taskId: string;
+  runId: string;
   path: string;
   branch: string;
   baseSha: string;
@@ -301,7 +412,7 @@ export class RepositoryPublisher {
       {
         name: "tests",
         executable: resolve(this.repositoryRoot, "node_modules/.bin/vitest"),
-        args: ["run"]
+        args: ["run", "--no-cache", "--configLoader", "runner"]
       },
       ...typecheckProjects.map((project) => ({
         name: `typecheck_${project.replaceAll("/", "_")}`,
@@ -309,6 +420,15 @@ export class RepositoryPublisher {
         args: ["-p", `${project}/tsconfig.json`, "--noEmit"]
       }))
     ];
+    for (const command of this.validationCommands) {
+      if (
+        !VALIDATION_NAME.test(command.name)
+        || !isAbsolute(command.executable)
+        || command.args.some((argument) => argument.includes("\0"))
+      ) {
+        throw new RepositoryPublisherError("git_invalid_validation_command", false);
+      }
+    }
     this.commandTimeoutMs = config.commandTimeoutMs ?? 10 * 60_000;
   }
 
@@ -337,23 +457,34 @@ export class RepositoryPublisher {
     return expectedSha;
   }
 
-  async prepareWorkspace(input: { taskId: string; baseSha: string }): Promise<RepositoryWorkspace> {
+  async prepareWorkspace(input: {
+    taskId: string;
+    runId: string;
+    baseSha: string;
+  }): Promise<RepositoryWorkspace> {
     this.validateTaskId(input.taskId);
+    this.validateTaskId(input.runId);
     validateSha(input.baseSha);
     await this.assertRepositoryRoot();
     const worktreesDirectory = resolve(this.stateDirectory, "worktrees");
-    const workspacePath = resolve(worktreesDirectory, input.taskId);
+    const workspacePath = resolve(worktreesDirectory, input.taskId, input.runId);
     if (!isPathWithin(worktreesDirectory, workspacePath)) {
       throw new RepositoryPublisherError("git_invalid_workspace_path", false);
     }
-    const branch = `meaworld-task/${input.taskId}`;
+    const branch = `meaworld-task/${input.taskId}/${input.runId}`;
     validateBranch(branch);
-    await mkdir(worktreesDirectory, { recursive: true });
+    await mkdir(dirname(workspacePath), { recursive: true });
 
     if (await exists(workspacePath)) {
       await this.assertWorkspace(workspacePath, branch, input.baseSha);
-      await this.linkDependencies(workspacePath);
-      return { taskId: input.taskId, path: workspacePath, branch, baseSha: input.baseSha };
+      await this.removeDependencyLinks(workspacePath);
+      return {
+        taskId: input.taskId,
+        runId: input.runId,
+        path: workspacePath,
+        branch,
+        baseSha: input.baseSha
+      };
     }
 
     const branchExists = await this.gitExitZero(
@@ -370,30 +501,37 @@ export class RepositoryPublisher {
       await this.git(["worktree", "add", "-b", branch, workspacePath, input.baseSha], this.repositoryRoot);
     }
     await this.assertWorkspace(workspacePath, branch, input.baseSha);
-    await this.linkDependencies(workspacePath);
-    return { taskId: input.taskId, path: workspacePath, branch, baseSha: input.baseSha };
+    return {
+      taskId: input.taskId,
+      runId: input.runId,
+      path: workspacePath,
+      branch,
+      baseSha: input.baseSha
+    };
   }
 
   async inspectTaskCommit(taskId: string): Promise<TaskCommit | null> {
     this.validateTaskId(taskId);
     await this.assertRepositoryRoot();
-    const localBranch = `refs/heads/meaworld-task/${taskId}`;
-    let searchRef: string | null = await this.gitExitZero(
-      ["show-ref", "--verify", "--quiet", localBranch],
-      this.repositoryRoot
-    ) ? localBranch : null;
-
-    if (!searchRef) {
-      const remoteHead = await this.remoteSha(this.targetBranch);
-      if (!remoteHead) return null;
+    const searchRefs: string[] = [];
+    const remoteHead = await this.remoteSha(this.targetBranch);
+    if (remoteHead) {
       await this.git(
         ["fetch", "--no-tags", this.remote, `refs/heads/${this.targetBranch}`],
         this.repositoryRoot,
         "git_fetch_failed",
         true
       );
-      searchRef = "FETCH_HEAD";
+      searchRefs.push("FETCH_HEAD");
     }
+
+    const localRefs = (await this.git([
+      "for-each-ref",
+      "--format=%(refname)",
+      `refs/heads/meaworld-task/${taskId}`
+    ], this.repositoryRoot)).stdout.split(/\r?\n/).map((ref) => ref.trim()).filter(Boolean);
+    searchRefs.push(...localRefs);
+    if (searchRefs.length === 0) return null;
 
     const logResult = await this.git([
       "log",
@@ -402,7 +540,7 @@ export class RepositoryPublisher {
       "--format=%H%x1f%B%x1e",
       "--fixed-strings",
       `--grep=MeaWorld-Task-ID: ${taskId}`,
-      searchRef
+      ...searchRefs
     ], this.repositoryRoot);
     const records = logResult.stdout.split("\x1e").map((record) => record.trim()).filter(Boolean);
     for (const record of records) {
@@ -420,7 +558,6 @@ export class RepositoryPublisher {
       const treeSha = (await this.git(["rev-parse", `${commitSha}^{tree}`], this.repositoryRoot)).stdout.trim();
       validateSha(baseSha);
       validateSha(treeSha);
-      const remoteHead = await this.remoteSha(this.targetBranch);
       return {
         taskId,
         runId,
@@ -442,7 +579,20 @@ export class RepositoryPublisher {
     this.validateTaskId(input.taskId);
     this.validateTaskId(input.runId);
     validateSha(input.expectedBaseSha);
-    if (input.workspace.taskId !== input.taskId || input.workspace.baseSha !== input.expectedBaseSha) {
+    const expectedWorkspacePath = resolve(
+      this.stateDirectory,
+      "worktrees",
+      input.taskId,
+      input.runId
+    );
+    const expectedBranch = `meaworld-task/${input.taskId}/${input.runId}`;
+    if (
+      input.workspace.taskId !== input.taskId
+      || input.workspace.runId !== input.runId
+      || input.workspace.baseSha !== input.expectedBaseSha
+      || resolve(input.workspace.path) !== expectedWorkspacePath
+      || input.workspace.branch !== expectedBranch
+    ) {
       throw new RepositoryPublisherError("git_workspace_ownership_mismatch", false);
     }
     await this.assertWorkspace(input.workspace.path, input.workspace.branch, input.expectedBaseSha);
@@ -458,21 +608,68 @@ export class RepositoryPublisher {
     const initialFiles = await this.changedFiles(input.workspace.path);
     if (initialFiles.length === 0) return { status: "noop", headSha };
     await this.assertChangePolicy(input.workspace.path, initialFiles);
+    await this.assertWorkingTreeContentPolicy(input.workspace.path, initialFiles);
 
-    for (const command of this.validationCommands) {
-      try {
-        await runFile(command.executable, command.args, {
-          cwd: input.workspace.path,
-          timeoutMs: this.commandTimeoutMs
-        });
-      } catch {
-        throw new RepositoryPublisherError(`git_validation_${command.name}_failed`, false);
+    const validationDirectory = resolve(
+      this.stateDirectory,
+      "validation",
+      input.taskId,
+      input.runId
+    );
+    if (!isPathWithin(this.stateDirectory, validationDirectory)) {
+      throw new RepositoryPublisherError("git_invalid_validation_directory", false);
+    }
+    if (process.platform !== "darwin" || !await exists(SANDBOX_EXECUTABLE)) {
+      throw new RepositoryPublisherError("git_validation_sandbox_unavailable", false);
+    }
+    await rm(validationDirectory, { recursive: true, force: true });
+    const validationHome = resolve(validationDirectory, "home");
+    const validationTemporaryDirectory = resolve(validationDirectory, "tmp");
+    await mkdir(validationHome, { recursive: true });
+    await mkdir(validationTemporaryDirectory, { recursive: true });
+    const dependencyLinks = await this.dependencyLinks(input.workspace.path);
+    try {
+      await this.linkDependencies(input.workspace.path, dependencyLinks);
+      const sandboxWorkspacePath = await realpath(input.workspace.path);
+      const sandboxValidationDirectory = await realpath(validationDirectory);
+      const sandboxHome = await realpath(validationHome);
+      const sandboxTemporaryDirectory = await realpath(validationTemporaryDirectory);
+      const sandboxDependencyRoots = await Promise.all(
+        dependencyLinks.map(({ source }) => realpath(source))
+      );
+      const profile = sandboxProfile(
+        sandboxWorkspacePath,
+        sandboxValidationDirectory,
+        sandboxDependencyRoots
+      );
+      const environment = validationEnvironment(
+        sandboxHome,
+        sandboxTemporaryDirectory
+      );
+      for (const command of this.validationCommands) {
+        try {
+          await runFile(
+            SANDBOX_EXECUTABLE,
+            ["-p", profile, command.executable, ...command.args],
+            {
+              cwd: input.workspace.path,
+              env: environment,
+              timeoutMs: this.commandTimeoutMs
+            }
+          );
+        } catch {
+          throw new RepositoryPublisherError(`git_validation_${command.name}_failed`, false);
+        }
       }
+    } finally {
+      await this.removeDependencyLinks(input.workspace.path);
+      await rm(validationDirectory, { recursive: true, force: true });
     }
 
     const finalFiles = await this.changedFiles(input.workspace.path);
     if (finalFiles.length === 0) return { status: "noop", headSha };
     await this.assertChangePolicy(input.workspace.path, finalFiles);
+    await this.assertWorkingTreeContentPolicy(input.workspace.path, finalFiles);
     await this.git([
       "add",
       "--all",
@@ -539,6 +736,17 @@ export class RepositoryPublisher {
   }
 
   async cleanup(workspace: RepositoryWorkspace): Promise<void> {
+    this.validateTaskId(workspace.taskId);
+    this.validateTaskId(workspace.runId);
+    const expectedPath = resolve(
+      this.stateDirectory,
+      "worktrees",
+      workspace.taskId,
+      workspace.runId
+    );
+    if (resolve(workspace.path) !== expectedPath) {
+      throw new RepositoryPublisherError("git_workspace_ownership_mismatch", false);
+    }
     await this.removeDependencyLinks(workspace.path);
     const status = await this.git(["status", "--porcelain=v1", "--untracked-files=all"], workspace.path);
     if (status.stdout.trim()) {
@@ -576,29 +784,61 @@ export class RepositoryPublisher {
     }
   }
 
-  private async linkDependencies(workspacePath: string): Promise<void> {
-    for (const { source, destination, destinationParent } of await this.dependencyLinks(workspacePath)) {
-      if (await exists(destination)) continue;
+  private async linkDependencies(
+    workspacePath: string,
+    links?: DependencyLink[]
+  ): Promise<void> {
+    const dependencyLinks = links ?? await this.dependencyLinks(workspacePath);
+    for (const { source, destination, destinationParent, mode } of dependencyLinks) {
+      if (await exists(destination)) {
+        throw new RepositoryPublisherError("git_dependency_path_tampered", false);
+      }
       await mkdir(destinationParent, { recursive: true });
-      await symlink(source, destination, "dir");
+      if (mode === "symlink") {
+        await symlink(source, destination, "dir");
+      } else {
+        await mkdir(destination);
+        await this.mirrorDependencyDirectory(source, destination);
+      }
     }
   }
 
   private async removeDependencyLinks(workspacePath: string): Promise<void> {
-    for (const { source, destination } of await this.dependencyLinks(workspacePath)) {
+    for (const { source, destination, mode } of await this.dependencyLinks(workspacePath)) {
       if (!await exists(destination)) continue;
       const metadata = await lstat(destination);
-      if (!metadata.isSymbolicLink()) continue;
-      const target = resolve(dirname(destination), await readlink(destination));
-      if (target === source) await unlink(destination);
+      if (mode === "mirror") {
+        if (metadata.isSymbolicLink()) {
+          await unlink(destination);
+        } else if (metadata.isDirectory()) {
+          await rm(destination, { recursive: true, force: true });
+        }
+        continue;
+      }
+      if (metadata.isSymbolicLink()) {
+        const target = resolve(dirname(destination), await readlink(destination));
+        if (target === source) await unlink(destination);
+      }
     }
   }
 
-  private async dependencyLinks(workspacePath: string): Promise<Array<{
-    source: string;
-    destination: string;
-    destinationParent: string;
-  }>> {
+  private async mirrorDependencyDirectory(source: string, destination: string): Promise<void> {
+    for (const entry of await readdir(source, { withFileTypes: true })) {
+      if (entry.name === ".bin") continue;
+      const sourceEntry = resolve(source, entry.name);
+      const destinationEntry = resolve(destination, entry.name);
+      if (entry.isSymbolicLink()) {
+        await symlink(await readlink(sourceEntry), destinationEntry, "dir");
+      } else if (entry.isDirectory()) {
+        await mkdir(destinationEntry);
+        await this.mirrorDependencyDirectory(sourceEntry, destinationEntry);
+      } else {
+        throw new RepositoryPublisherError("git_dependency_layout_unsupported", false);
+      }
+    }
+  }
+
+  private async dependencyLinks(workspacePath: string): Promise<DependencyLink[]> {
     const candidates = [this.repositoryRoot];
     for (const directory of ["apps", "packages"]) {
       const parent = resolve(this.repositoryRoot, directory);
@@ -607,14 +847,19 @@ export class RepositoryPublisher {
         if (entry.isDirectory()) candidates.push(resolve(parent, entry.name));
       }
     }
-    const links: Array<{ source: string; destination: string; destinationParent: string }> = [];
+    const links: DependencyLink[] = [];
     for (const sourceParent of candidates) {
       const source = resolve(sourceParent, "node_modules");
       if (!await exists(source)) continue;
       const relativeParent = relative(this.repositoryRoot, sourceParent);
       const destinationParent = resolve(workspacePath, relativeParent);
       const destination = resolve(destinationParent, "node_modules");
-      links.push({ source, destination, destinationParent });
+      links.push({
+        source,
+        destination,
+        destinationParent,
+        mode: sourceParent === this.repositoryRoot ? "symlink" : "mirror"
+      });
     }
     return links;
   }
@@ -638,6 +883,38 @@ export class RepositoryPublisher {
     const rawDiff = await this.git(["diff", "--raw", "HEAD", "--"], workspacePath);
     if (/(?:^|\s)160000(?:\s|$)/m.test(rawDiff.stdout)) {
       throw new RepositoryPublisherError("git_gitlink_changed", false);
+    }
+  }
+
+  private async assertWorkingTreeContentPolicy(
+    workspacePath: string,
+    paths: string[]
+  ): Promise<void> {
+    for (const path of paths) {
+      const absolutePath = resolve(workspacePath, path);
+      if (!isPathWithin(workspacePath, absolutePath)) {
+        throw new RepositoryPublisherError("git_invalid_changed_path", false);
+      }
+      let metadata;
+      try {
+        metadata = await lstat(absolutePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (metadata.isSymbolicLink()) {
+        throw new RepositoryPublisherError("git_symlink_changed", false);
+      }
+      if (!metadata.isFile() || metadata.size > 12 * 1024 * 1024) {
+        throw new RepositoryPublisherError("git_changed_file_unscannable", false);
+      }
+      const content = (await readFile(absolutePath)).toString("utf8");
+      if (path.endsWith(".env.example") && envExampleHasValues(content)) {
+        throw new RepositoryPublisherError("git_env_example_contains_value", false);
+      }
+      if (containsLikelySecret(content)) {
+        throw new RepositoryPublisherError("git_likely_secret_detected", false);
+      }
     }
   }
 
@@ -685,7 +962,7 @@ export class RepositoryPublisher {
     maxBuffer = MAX_COMMAND_OUTPUT
   ): Promise<CommandResult> {
     try {
-      return await runFile("git", arguments_, {
+      return await runFile("git", ["-c", "core.hooksPath=/dev/null", ...arguments_], {
         cwd,
         timeoutMs: this.commandTimeoutMs,
         maxBuffer
@@ -697,7 +974,10 @@ export class RepositoryPublisher {
 
   private async gitExitZero(arguments_: string[], cwd: string): Promise<boolean> {
     try {
-      await runFile("git", arguments_, { cwd, timeoutMs: this.commandTimeoutMs });
+      await runFile("git", ["-c", "core.hooksPath=/dev/null", ...arguments_], {
+        cwd,
+        timeoutMs: this.commandTimeoutMs
+      });
       return true;
     } catch {
       return false;

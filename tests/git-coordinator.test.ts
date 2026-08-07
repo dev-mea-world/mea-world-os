@@ -137,7 +137,13 @@ function fakePublisher(commitStatus: "committed" | "noop" = "committed") {
   > = {
     async resolveBase() { return BASE_SHA; },
     async prepareWorkspace() {
-      return { taskId: TASK_ID, path: "/tmp/fake-worktree", branch: `meaworld-task/${TASK_ID}`, baseSha: BASE_SHA };
+      return {
+        taskId: TASK_ID,
+        runId: RUN_ID,
+        path: "/tmp/fake-worktree",
+        branch: `meaworld-task/${TASK_ID}/${RUN_ID}`,
+        baseSha: BASE_SHA
+      };
     },
     async inspectTaskCommit() { return null; },
     async validateAndCommit() {
