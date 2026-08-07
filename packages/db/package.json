@@ -1,0 +1,29 @@
+{
+  "name": "@meaworld/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./migrate": "./src/migrate.ts"
+  },
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "migrate": "tsx src/cli.ts migrate",
+    "seed:phase0": "tsx src/cli.ts seed",
+    "seed:recovery": "tsx src/cli.ts seed-recovery",
+    "enqueue:repo-update": "tsx src/cli.ts enqueue-repo-update"
+  },
+  "dependencies": {
+    "@meaworld/approvals": "workspace:*",
+    "@meaworld/domain": "workspace:*",
+    "@meaworld/observability": "workspace:*",
+    "@meaworld/security": "workspace:*",
+    "postgres": "3.4.9"
+  },
+  "devDependencies": {
+    "tsx": "4.23.9",
+    "typescript": "6.0.3"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "@meaworld/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "once": "tsx src/index.ts once",
+    "start": "tsx src/index.ts daemon",
+    "notion:smoke": "tsx src/index.ts notion-smoke",
+    "codex:smoke": "tsx src/index.ts codex-smoke"
+  },
+  "dependencies": {
+    "@meaworld/codex": "workspace:*",
+    "@meaworld/domain": "workspace:*",
+    "@meaworld/git": "workspace:*",
+    "@meaworld/notion": "workspace:*",
+    "@meaworld/observability": "workspace:*",
+    "@meaworld/orchestration": "workspace:*",
+    "@meaworld/security": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "tsx": "4.23.9",
+    "typescript": "6.0.3"
+  }
+}

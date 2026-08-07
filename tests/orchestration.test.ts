@@ -1,0 +1,243 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CodexSdkRuntime,
+  type AgentRuntime,
+  type AgentTaskInput,
+  type AgentContinuation,
+  type AgentRun,
+  type AgentRunState
+} from "@meaworld/codex";
+import type { TaskRecord } from "@meaworld/domain";
+import { executeTask } from "@meaworld/orchestration";
+
+class FakeRuntime implements AgentRuntime {
+  readonly starts: AgentTaskInput[] = [];
+
+  constructor(
+    private readonly response: string,
+    private readonly status: AgentRun["status"] = "succeeded",
+    private readonly error?: unknown
+  ) {}
+
+  async start(input: AgentTaskInput): Promise<AgentRun> {
+    this.starts.push(input);
+    if (this.error !== undefined) throw this.error;
+    return {
+      runId: input.runId,
+      runtimeThreadId: "fake-thread",
+      status: this.status,
+      finalResponse: this.response,
+      usage: { inputTokens: 1 }
+    };
+  }
+  resume(input: AgentContinuation): Promise<AgentRun> { return this.start(input); }
+  async cancel(): Promise<void> {}
+  async inspect(runId: string): Promise<AgentRunState> { return { runId, status: "succeeded" }; }
+}
+
+const smokeTask: TaskRecord = {
+  id: "c3b3913d-894e-4a8a-8d75-c491ab007fcb",
+  kind: "phase0.codex-smoke",
+  objective: "smoke",
+  status: "running",
+  priority: 100,
+  risk: "low",
+  payload: { prompt: "Return exactly PHASE0_CODEX_OK" },
+  dedupeKey: "phase0:test",
+  assignedWorkerId: "worker",
+  leaseToken: "c89d557b-47ce-4ca2-af2e-5c94056796f4",
+  leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+  attemptCount: 1,
+  maxAttempts: 3,
+  version: 2,
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString()
+};
+
+function taskWith(kind: string, payload: Record<string, unknown>): TaskRecord {
+  return { ...smokeTask, kind, objective: kind, payload };
+}
+
+describe("Codex SDK runtime", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("passes explicit permissions and safe defaults to start and resume", async () => {
+    const runtime = new CodexSdkRuntime({ codexPathOverride: "/nonexistent/codex" });
+    const codex = (runtime as unknown as {
+      codex: {
+        startThread(options: Record<string, unknown>): unknown;
+        resumeThread(id: string, options: Record<string, unknown>): unknown;
+      };
+    }).codex;
+    const thread = {
+      id: "sdk-thread",
+      run: vi.fn().mockResolvedValue({ finalResponse: "done", usage: null })
+    };
+    const startThread = vi.spyOn(codex, "startThread").mockReturnValue(thread);
+    const resumeThread = vi.spyOn(codex, "resumeThread").mockReturnValue(thread);
+
+    await runtime.start({
+      runId: "start-run",
+      prompt: "start",
+      workingDirectory: "/tmp/worktree",
+      sandboxMode: "workspace-write",
+      networkAccessEnabled: true
+    });
+    expect(startThread).toHaveBeenCalledWith({
+      workingDirectory: "/tmp/worktree",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      networkAccessEnabled: true,
+      webSearchMode: "disabled",
+      skipGitRepoCheck: false
+    });
+
+    await runtime.resume({
+      runId: "resume-run",
+      runtimeThreadId: "existing-thread",
+      prompt: "resume",
+      workingDirectory: "/tmp/worktree"
+    });
+    expect(resumeThread).toHaveBeenCalledWith("existing-thread", {
+      workingDirectory: "/tmp/worktree",
+      sandboxMode: "read-only",
+      approvalPolicy: "never",
+      networkAccessEnabled: false,
+      webSearchMode: "disabled",
+      skipGitRepoCheck: false
+    });
+  });
+
+  it("constructs Codex with only the allowlisted process environment", async () => {
+    vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
+    vi.stubEnv("LC_TEST", "it_IT");
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.invalid");
+    vi.stubEnv("NOTION_TOKEN", "notion-placeholder");
+    vi.stubEnv("WORKER_SECRET", "worker-placeholder");
+    vi.stubEnv("SESSION_SECRET", "session-placeholder");
+    vi.stubEnv("DASHBOARD_ACCESS_CODE", "dashboard-placeholder");
+    vi.stubEnv("OPENAI_API_KEY", "openai-placeholder");
+    vi.stubEnv("DATABASE_URL", "postgres://project-placeholder");
+
+    const runtime = new CodexSdkRuntime({ codexPathOverride: "/nonexistent/codex" });
+    const env = (runtime as unknown as {
+      codex: { exec: { envOverride: Record<string, string> } };
+    }).codex.exec.envOverride;
+    expect(env).toMatchObject({
+      CODEX_HOME: "/tmp/codex-home",
+      LC_TEST: "it_IT",
+      HTTPS_PROXY: "http://proxy.invalid"
+    });
+    expect(env).not.toHaveProperty("NOTION_TOKEN");
+    expect(env).not.toHaveProperty("WORKER_SECRET");
+    expect(env).not.toHaveProperty("SESSION_SECRET");
+    expect(env).not.toHaveProperty("DASHBOARD_ACCESS_CODE");
+    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(env).not.toHaveProperty("DATABASE_URL");
+  });
+});
+
+describe("task execution", () => {
+  it("keeps the smoke task read-only and accepts only its exact harmless marker", async () => {
+    const runtime = new FakeRuntime("PHASE0_CODEX_OK");
+    const result = await executeTask({
+      task: smokeTask,
+      runId: "07e053b2-727b-465c-a23c-209743ad5bd2",
+      runtime,
+      workingDirectory: process.cwd()
+    });
+    expect(result.outcome).toBe("succeeded");
+    expect(result.output).toMatchObject({ marker: "PHASE0_CODEX_OK" });
+    expect(runtime.starts).toEqual([
+      expect.objectContaining({
+        prompt: "Return exactly PHASE0_CODEX_OK",
+        sandboxMode: "read-only",
+        networkAccessEnabled: false
+      })
+    ]);
+  });
+
+  it("fails closed on an unexpected response", async () => {
+    const result = await executeTask({
+      task: smokeTask,
+      runId: "37f5789a-215f-4831-a325-18200419de5c",
+      runtime: new FakeRuntime("almost"),
+      workingDirectory: process.cwd()
+    });
+    expect(result.outcome).toBe("failed_terminal");
+  });
+
+  it("runs repo updates workspace-write without network and never persists the response", async () => {
+    const sensitiveResponse = "completed with NOTION_TOKEN=should-not-persist";
+    const runtime = new FakeRuntime(sensitiveResponse);
+    const result = await executeTask({
+      task: taskWith("repo.update", { prompt: "Update the requested repository files." }),
+      runId: "d029d914-9852-4bce-b159-34a480857889",
+      runtime,
+      workingDirectory: "/tmp/provided-worktree"
+    });
+
+    expect(result).toEqual({
+      outcome: "succeeded",
+      runtimeThreadId: "fake-thread",
+      output: {
+        runtimeStatus: "succeeded",
+        usage: { inputTokens: 1 }
+      },
+      errorSummary: null
+    });
+    expect(JSON.stringify(result)).not.toContain(sensitiveResponse);
+    expect(runtime.starts[0]).toMatchObject({
+      workingDirectory: "/tmp/provided-worktree",
+      sandboxMode: "workspace-write",
+      networkAccessEnabled: false
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Update the requested repository files.");
+    expect(runtime.starts[0]?.prompt).toContain("only inside the provided worktree");
+    expect(runtime.starts[0]?.prompt).toContain("Do not read secret files");
+    expect(runtime.starts[0]?.prompt).toContain("Do not commit or push");
+    expect(runtime.starts[0]?.prompt).toContain("Do not use the network");
+    expect(runtime.starts[0]?.prompt).toContain("for a separate verifier");
+  });
+
+  it.each([
+    ["missing", {}],
+    ["non-string", { prompt: 42 }],
+    ["empty", { prompt: " \n\t" }],
+    ["oversized", { prompt: "x".repeat(20_001) }]
+  ])("fails closed on a %s repo update prompt", async (_label, payload) => {
+    const runtime = new FakeRuntime("unused");
+    const result = await executeTask({
+      task: taskWith("repo.update", payload),
+      runId: "15f7482a-1f92-4aa9-8956-3d269c5208f5",
+      runtime,
+      workingDirectory: process.cwd()
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_terminal",
+      runtimeThreadId: null,
+      output: null
+    });
+    expect(runtime.starts).toEqual([]);
+  });
+
+  it("sanitizes repo update runtime exceptions", async () => {
+    const result = await executeTask({
+      task: taskWith("repo.update", { prompt: "Make a bounded update." }),
+      runId: "98df2684-2084-4254-a291-140b1f3c72d7",
+      runtime: new FakeRuntime("", "failed", new Error("WORKER_SECRET=should-not-persist")),
+      workingDirectory: process.cwd()
+    });
+
+    expect(result).toEqual({
+      outcome: "failed_retryable",
+      runtimeThreadId: null,
+      output: null,
+      errorSummary: "Codex repository update execution failed"
+    });
+    expect(JSON.stringify(result)).not.toContain("should-not-persist");
+  });
+});
