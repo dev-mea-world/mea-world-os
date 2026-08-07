@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -44,7 +44,25 @@ async function createRepository(): Promise<{
   await writeFile(join(repository, ".gitignore"), ".phase0/\nnode_modules/\n", "utf8");
   await writeFile(join(repository, "README.md"), "baseline\n", "utf8");
   await mkdir(join(repository, "node_modules"));
-  git(repository, ["add", ".gitignore", "README.md"]);
+  await mkdir(join(repository, "packages", "library"), { recursive: true });
+  await mkdir(join(repository, "packages", "consumer", "node_modules", "@meaworld"), { recursive: true });
+  await writeFile(join(repository, "packages", "library", "package.json"), JSON.stringify({
+    name: "@meaworld/library",
+    version: "0.0.0",
+    exports: "./index.js"
+  }), "utf8");
+  await writeFile(join(repository, "packages", "library", "index.js"), "export const fixture = true;\n", "utf8");
+  await writeFile(join(repository, "packages", "consumer", "package.json"), JSON.stringify({
+    name: "@meaworld/consumer",
+    version: "0.0.0",
+    dependencies: { "@meaworld/library": "workspace:*" }
+  }), "utf8");
+  await symlink(
+    "../../../library",
+    join(repository, "packages", "consumer", "node_modules", "@meaworld", "library"),
+    "dir"
+  );
+  git(repository, ["add", ".gitignore", "README.md", "packages"]);
   git(repository, [
     "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
     "commit", "-m", "initial"
@@ -290,6 +308,8 @@ describe("automatic Git publisher", () => {
       `if(!process.env.HOME||process.env.HOME===${JSON.stringify(inheritedHome)})process.exit(11);`,
       `try{fs.readFileSync(${JSON.stringify(hostSecretPath)});process.exit(12)}catch{}`,
       `try{fs.writeFileSync(${JSON.stringify(outsideWritePath)},'blocked');process.exit(13)}catch{}`,
+      "const internal=fs.realpathSync(path.join(process.cwd(),'packages','consumer','node_modules','@meaworld','library','package.json'));",
+      "if(!internal.startsWith(process.cwd()+path.sep))process.exit(16);",
       "const socket=net.connect({host:'1.1.1.1',port:443});",
       "socket.on('connect',()=>process.exit(14));",
       "socket.on('error',()=>{fs.writeFileSync(path.join(process.cwd(),'sandbox-proof.txt'),'isolated\\n');process.exit(0)});",

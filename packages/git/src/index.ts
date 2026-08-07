@@ -68,6 +68,13 @@ interface CommandFailure extends Error {
   stderr?: string;
 }
 
+interface DependencyLink {
+  source: string;
+  destination: string;
+  destinationParent: string;
+  mode: "mirror" | "symlink";
+}
+
 function runFile(
   executable: string,
   arguments_: string[],
@@ -110,12 +117,13 @@ function validationEnvironment(home: string, temporaryDirectory: string): NodeJS
     LOGNAME: "meaworld-loop",
     NODE_DISABLE_COMPILE_CACHE: "1",
     NO_COLOR: "1",
-    PATH: `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${dirname(process.execPath)}:/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`,
     TEMP: temporaryDirectory,
     TMP: temporaryDirectory,
     TMPDIR: temporaryDirectory,
     TZ: "UTC",
-    USER: "meaworld-loop"
+    USER: "meaworld-loop",
+    __CF_USER_TEXT_ENCODING: "0x1F5:0x0:0x0"
   };
 }
 
@@ -180,7 +188,9 @@ function sandboxProfile(
     "(allow process*)",
     "(allow sysctl-read)",
     "(allow signal (target self))",
+    "(allow signal (target children))",
     "(allow ipc-posix-shm)",
+    '(allow mach-lookup (global-name "com.apple.system.notification_center") (global-name "com.apple.system.opendirectoryd.libinfo"))',
     '(allow file-read-data (literal "/"))',
     `(allow file-read-metadata (literal "/") ${ancestorMetadata})`,
     `(allow file-read* ${reads})`,
@@ -402,7 +412,7 @@ export class RepositoryPublisher {
       {
         name: "tests",
         executable: resolve(this.repositoryRoot, "node_modules/.bin/vitest"),
-        args: ["run", "--no-cache"]
+        args: ["run", "--no-cache", "--configLoader", "runner"]
       },
       ...typecheckProjects.map((project) => ({
         name: `typecheck_${project.replaceAll("/", "_")}`,
@@ -776,41 +786,59 @@ export class RepositoryPublisher {
 
   private async linkDependencies(
     workspacePath: string,
-    links?: Awaited<ReturnType<RepositoryPublisher["dependencyLinks"]>>
+    links?: DependencyLink[]
   ): Promise<void> {
     const dependencyLinks = links ?? await this.dependencyLinks(workspacePath);
-    for (const { source, destination, destinationParent } of dependencyLinks) {
+    for (const { source, destination, destinationParent, mode } of dependencyLinks) {
       if (await exists(destination)) {
-        const metadata = await lstat(destination);
-        if (!metadata.isSymbolicLink()) {
-          throw new RepositoryPublisherError("git_dependency_path_tampered", false);
-        }
-        const target = resolve(dirname(destination), await readlink(destination));
-        if (target !== source) {
-          throw new RepositoryPublisherError("git_dependency_path_tampered", false);
-        }
-        continue;
+        throw new RepositoryPublisherError("git_dependency_path_tampered", false);
       }
       await mkdir(destinationParent, { recursive: true });
-      await symlink(source, destination, "dir");
+      if (mode === "symlink") {
+        await symlink(source, destination, "dir");
+      } else {
+        await mkdir(destination);
+        await this.mirrorDependencyDirectory(source, destination);
+      }
     }
   }
 
   private async removeDependencyLinks(workspacePath: string): Promise<void> {
-    for (const { source, destination } of await this.dependencyLinks(workspacePath)) {
+    for (const { source, destination, mode } of await this.dependencyLinks(workspacePath)) {
       if (!await exists(destination)) continue;
       const metadata = await lstat(destination);
-      if (!metadata.isSymbolicLink()) continue;
-      const target = resolve(dirname(destination), await readlink(destination));
-      if (target === source) await unlink(destination);
+      if (mode === "mirror") {
+        if (metadata.isSymbolicLink()) {
+          await unlink(destination);
+        } else if (metadata.isDirectory()) {
+          await rm(destination, { recursive: true, force: true });
+        }
+        continue;
+      }
+      if (metadata.isSymbolicLink()) {
+        const target = resolve(dirname(destination), await readlink(destination));
+        if (target === source) await unlink(destination);
+      }
     }
   }
 
-  private async dependencyLinks(workspacePath: string): Promise<Array<{
-    source: string;
-    destination: string;
-    destinationParent: string;
-  }>> {
+  private async mirrorDependencyDirectory(source: string, destination: string): Promise<void> {
+    for (const entry of await readdir(source, { withFileTypes: true })) {
+      if (entry.name === ".bin") continue;
+      const sourceEntry = resolve(source, entry.name);
+      const destinationEntry = resolve(destination, entry.name);
+      if (entry.isSymbolicLink()) {
+        await symlink(await readlink(sourceEntry), destinationEntry, "dir");
+      } else if (entry.isDirectory()) {
+        await mkdir(destinationEntry);
+        await this.mirrorDependencyDirectory(sourceEntry, destinationEntry);
+      } else {
+        throw new RepositoryPublisherError("git_dependency_layout_unsupported", false);
+      }
+    }
+  }
+
+  private async dependencyLinks(workspacePath: string): Promise<DependencyLink[]> {
     const candidates = [this.repositoryRoot];
     for (const directory of ["apps", "packages"]) {
       const parent = resolve(this.repositoryRoot, directory);
@@ -819,14 +847,19 @@ export class RepositoryPublisher {
         if (entry.isDirectory()) candidates.push(resolve(parent, entry.name));
       }
     }
-    const links: Array<{ source: string; destination: string; destinationParent: string }> = [];
+    const links: DependencyLink[] = [];
     for (const sourceParent of candidates) {
       const source = resolve(sourceParent, "node_modules");
       if (!await exists(source)) continue;
       const relativeParent = relative(this.repositoryRoot, sourceParent);
       const destinationParent = resolve(workspacePath, relativeParent);
       const destination = resolve(destinationParent, "node_modules");
-      links.push({ source, destination, destinationParent });
+      links.push({
+        source,
+        destination,
+        destinationParent,
+        mode: sourceParent === this.repositoryRoot ? "symlink" : "mirror"
+      });
     }
     return links;
   }
