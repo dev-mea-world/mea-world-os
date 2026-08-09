@@ -7,6 +7,7 @@ coverage/
 .env
 .env.*
 !.env.example
+enc.local.vercel
 *.log
 .DS_Store
 .vercel/

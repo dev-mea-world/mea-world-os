@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexSdkRuntime,
@@ -200,6 +201,96 @@ describe("task execution", () => {
     expect(runtime.starts[0]?.prompt).toContain("Do not commit or push");
     expect(runtime.starts[0]?.prompt).toContain("Do not use the network");
     expect(runtime.starts[0]?.prompt).toContain("for a separate verifier");
+  });
+
+  it("runs Telegram operator queries read-only without tools or network", async () => {
+    const runtime = new FakeRuntime("Risposta concisa");
+    const result = await executeTask({
+      task: taskWith("operator.query", { prompt: "Che cosa puoi fare?" }),
+      runId: "987e053b-3ed5-4981-bbac-e04518ef743e",
+      runtime,
+      workingDirectory: "/tmp/operator-context"
+    });
+
+    expect(result).toEqual({
+      outcome: "succeeded",
+      runtimeThreadId: "fake-thread",
+      output: {
+        response: "Risposta concisa",
+        usage: { inputTokens: 1 }
+      },
+      errorSummary: null
+    });
+    expect(runtime.starts[0]).toMatchObject({
+      workingDirectory: "/tmp/operator-context",
+      sandboxMode: "read-only",
+      networkAccessEnabled: false
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Do not inspect files");
+    expect(runtime.starts[0]?.prompt).toContain("Do not call tools");
+    expect(runtime.starts[0]?.prompt).toContain("Che cosa puoi fare?");
+  });
+
+  it("routes Telegram change requests into a strict confirmation decision", async () => {
+    const runtime = new FakeRuntime(JSON.stringify({
+      intent: "repo_update",
+      objective: "Invia automaticamente le risposte Telegram",
+      implementationPrompt: "Implementa una outbox Telegram durevole e notifiche automatiche."
+    }));
+    const result = await executeTask({
+      task: taskWith("operator.request", {
+        prompt: "Migliora il bot e inviami automaticamente le risposte."
+      }),
+      runId: "a7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime,
+      workingDirectory: "/tmp/operator-context"
+    });
+
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        intent: "repo_update",
+        objective: "Invia automaticamente le risposte Telegram"
+      }
+    });
+    expect(runtime.starts[0]).toMatchObject({
+      sandboxMode: "read-only",
+      networkAccessEnabled: false
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Use repo_update when the operator asks");
+    expect(runtime.starts[0]?.prompt).toContain("Migliora il bot");
+  });
+
+  it("fails closed when Telegram request routing returns non-JSON or extra fields", async () => {
+    for (const response of [
+      "I would change the repository",
+      JSON.stringify({ intent: "answer", response: "ok", extra: true })
+    ]) {
+      const result = await executeTask({
+        task: taskWith("operator.request", { prompt: "Richiesta" }),
+        runId: randomUUID(),
+        runtime: new FakeRuntime(response),
+        workingDirectory: "/tmp/operator-context"
+      });
+      expect(result.outcome).toBe("failed_retryable");
+      expect(result.output).not.toHaveProperty("response");
+    }
+  });
+
+  it.each([
+    ["missing", {}],
+    ["empty", { prompt: "  " }],
+    ["oversized", { prompt: "x".repeat(4_001) }]
+  ])("fails closed on a %s operator query", async (_label, payload) => {
+    const runtime = new FakeRuntime("unused");
+    const result = await executeTask({
+      task: taskWith("operator.query", payload),
+      runId: "f0e6848b-c434-4ad1-a0b3-5a82252df9b4",
+      runtime,
+      workingDirectory: process.cwd()
+    });
+    expect(result.outcome).toBe("failed_terminal");
+    expect(runtime.starts).toEqual([]);
   });
 
   it.each([

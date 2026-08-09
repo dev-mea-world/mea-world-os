@@ -111,6 +111,10 @@ export function redactSecrets(value: unknown, secretNames = [
   "sessionToken",
   "workerSecret",
   "notionToken",
+  "telegramBotToken",
+  "botToken",
+  "telegramWebhookSecret",
+  "telegramPairingCode",
   "authorization",
   "cookie"
 ]): unknown {

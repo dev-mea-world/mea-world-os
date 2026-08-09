@@ -139,7 +139,7 @@ input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(22,123,98,
 .system-state > span { width: .5rem; height: .5rem; border-radius: 50%; background: var(--amber); }
 .state-running > span { background: var(--accent); box-shadow: 0 0 0 4px rgba(22,123,98,.12); }
 
-.metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1rem; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 1rem; margin-bottom: 1rem; }
 .metric-card, .panel { border: 1px solid rgba(220,222,216,.95); background: var(--panel); box-shadow: 0 12px 35px rgba(30,48,43,.045); }
 .metric-card { min-height: 9.2rem; padding: 1.25rem; border-radius: 1rem; }
 .metric-card p { color: var(--muted); font-size: .78rem; font-weight: 700; }

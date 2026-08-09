@@ -11,6 +11,8 @@ import type {
   ProposalRecord,
   RunComplete,
   RunRecord,
+  TelegramOutboxComplete,
+  TelegramOutboxRecord,
   TaskRecord,
   WorkerRecord
 } from "@meaworld/domain";
@@ -94,6 +96,20 @@ function runFromRow(row: Row): RunRecord {
     startedAt: asNullableString(row.started_at),
     completedAt: asNullableString(row.completed_at),
     createdAt: asString(row.created_at)
+  };
+}
+
+function telegramOutboxFromRow(row: Row): TelegramOutboxRecord {
+  return {
+    id: asString(row.id),
+    chatId: asNumber(row.chat_id),
+    text: asString(row.text),
+    replyMarkup: row.reply_markup === null || row.reply_markup === undefined
+      ? null
+      : asObject(row.reply_markup),
+    attemptCount: asNumber(row.attempt_count),
+    leaseToken: asString(row.lease_token),
+    leaseExpiresAt: asString(row.lease_expires_at)
   };
 }
 
@@ -258,56 +274,632 @@ export interface NotionSampleInput {
   errorCode: string | null;
 }
 
+interface TaskEnqueueInput {
+  kind: string;
+  objective: string;
+  payload: Record<string, unknown>;
+  dedupeKey: string;
+  priority?: number;
+  maxAttempts?: number;
+  risk?: "low" | "medium" | "high";
+}
+
+interface TaskEnqueueActor {
+  type: string;
+  id: string;
+  correlationId: string;
+}
+
+export type TelegramCommandAction =
+  | "pair"
+  | "help"
+  | "status"
+  | "tasks"
+  | "result"
+  | "ask"
+  | "request"
+  | "unknown";
+
+export interface TelegramCommandInput {
+  updateId: number;
+  chatId: number;
+  userId: number;
+  username: string | null;
+  messageId: number;
+  action: TelegramCommandAction;
+  pairCodeValid: boolean;
+  prompt: string | null;
+}
+
+export interface TelegramCommandResult {
+  duplicate: boolean;
+  authorized: boolean;
+  paired: boolean;
+  reason: "ok" | "not_paired" | "invalid_pairing_code" | "already_paired" | "invalid_prompt";
+  task: TaskRecord | null;
+}
+
+export interface TelegramCallbackInput {
+  updateId: number;
+  callbackQueryId: string;
+  chatId: number;
+  userId: number;
+  messageId: number;
+  changeRequestId: string;
+  decision: "approve" | "reject";
+}
+
+export interface TelegramCallbackResult {
+  duplicate: boolean;
+  authorized: boolean;
+  reason: "ok" | "not_paired" | "request_not_found" | "request_already_decided";
+  task: TaskRecord | null;
+}
+
+export interface TelegramTaskView {
+  task: TaskRecord;
+  latestRun: RunRecord | null;
+}
+
+async function enqueueTaskInTransaction(
+  database: Database,
+  input: TaskEnqueueInput,
+  actor: TaskEnqueueActor
+): Promise<TaskRecord> {
+  const existing = await database.query<Row>(
+    "SELECT * FROM tasks WHERE dedupe_key = $1 FOR UPDATE",
+    [input.dedupeKey]
+  );
+  if (existing[0]) return taskFromRow(existing[0]);
+
+  const id = randomUUID();
+  const inserted = await database.query<Row>(
+    `INSERT INTO tasks (
+       id, kind, objective, status, priority, risk, payload, dedupe_key, max_attempts
+     ) VALUES ($1, $2, $3, 'ready', $4, $5, ($6::jsonb #>> '{}')::jsonb, $7, $8)
+     RETURNING *`,
+    [
+      id,
+      input.kind,
+      input.objective,
+      input.priority ?? 0,
+      input.risk ?? "low",
+      JSON.stringify(input.payload),
+      input.dedupeKey,
+      input.maxAttempts ?? 3
+    ]
+  );
+  const task = taskFromRow(inserted[0] ?? {});
+  await appendEvent(database, {
+    type: "task.created",
+    actorType: actor.type,
+    actorId: actor.id,
+    aggregateType: "task",
+    aggregateId: id,
+    aggregateVersion: 1,
+    correlationId: actor.correlationId,
+    taskId: id,
+    payload: { kind: input.kind, dedupeKey: input.dedupeKey }
+  });
+  return task;
+}
+
+async function enqueueTelegramOutboxInTransaction(
+  database: Database,
+  input: {
+    dedupeKey: string;
+    chatId: number;
+    text: string;
+    replyMarkup?: Record<string, unknown> | null;
+    taskId?: string | null;
+    runId?: string | null;
+    correlationId: string;
+  }
+): Promise<void> {
+  const id = randomUUID();
+  const rows = await database.query<Row>(
+    `INSERT INTO telegram_outbox (id, dedupe_key, chat_id, text, reply_markup)
+     VALUES ($1, $2, $3, $4, ($5::jsonb #>> '{}')::jsonb)
+     ON CONFLICT (dedupe_key) DO NOTHING
+     RETURNING id`,
+    [id, input.dedupeKey, input.chatId, input.text, JSON.stringify(input.replyMarkup ?? null)]
+  );
+  if (!rows[0]) return;
+  await appendEvent(database, {
+    type: "telegram.notification_queued",
+    actorType: "system",
+    actorId: "telegram-outbox",
+    aggregateType: "telegram_outbox",
+    aggregateId: id,
+    aggregateVersion: 1,
+    correlationId: input.correlationId,
+    taskId: input.taskId ?? null,
+    runId: input.runId ?? null,
+    payload: { dedupeKey: input.dedupeKey }
+  });
+}
+
+async function enqueueTelegramTextInTransaction(
+  database: Database,
+  input: {
+    dedupeKey: string;
+    chatId: number;
+    text: string;
+    taskId?: string | null;
+    runId?: string | null;
+    correlationId: string;
+  }
+): Promise<void> {
+  const normalized = input.text.trim() || "Operazione completata senza un messaggio di risposta.";
+  const chunks = normalized.match(/[\s\S]{1,3800}/g) ?? [normalized];
+  for (const [index, chunk] of chunks.entries()) {
+    await enqueueTelegramOutboxInTransaction(database, {
+      ...input,
+      dedupeKey: `${input.dedupeKey}:${index}`,
+      text: chunk
+    });
+  }
+}
+
 export class Phase0Store {
   constructor(private readonly database: Database) {}
 
-  async enqueueTask(input: {
-    kind: string;
-    objective: string;
-    payload: Record<string, unknown>;
-    dedupeKey: string;
-    priority?: number;
-    maxAttempts?: number;
-    risk?: "low" | "medium" | "high";
-  }): Promise<TaskRecord> {
-    return this.database.transaction(async (transaction) => {
-      const existing = await transaction.query<Row>(
-        "SELECT * FROM tasks WHERE dedupe_key = $1 FOR UPDATE",
-        [input.dedupeKey]
-      );
-      if (existing[0]) return taskFromRow(existing[0]);
+  async enqueueTask(input: TaskEnqueueInput): Promise<TaskRecord> {
+    return this.database.transaction((transaction) => enqueueTaskInTransaction(
+      transaction,
+      input,
+      { type: "system", id: "task-enqueuer", correlationId: randomUUID() }
+    ));
+  }
 
-      const id = randomUUID();
-      const inserted = await transaction.query<Row>(
-        `INSERT INTO tasks (
-           id, kind, objective, status, priority, risk, payload, dedupe_key, max_attempts
-         ) VALUES ($1, $2, $3, 'ready', $4, $5, ($6::jsonb #>> '{}')::jsonb, $7, $8)
-         RETURNING *`,
+  async processTelegramCommand(input: TelegramCommandInput): Promise<TelegramCommandResult> {
+    return this.database.transaction(async (transaction) => {
+      const duplicate = await transaction.query<Row>(
+        "SELECT task_id FROM telegram_updates WHERE update_id = $1",
+        [input.updateId]
+      );
+      if (duplicate[0]) {
+        return {
+          duplicate: true,
+          authorized: false,
+          paired: false,
+          reason: "ok",
+          task: null
+        };
+      }
+
+      const operatorRows = await transaction.query<Row>(
+        "SELECT * FROM telegram_operator WHERE singleton = true FOR UPDATE"
+      );
+      const operator = operatorRows[0];
+      let authorized = Boolean(
+        operator
+        && !operator.revoked_at
+        && asNumber(operator.chat_id) === input.chatId
+        && asNumber(operator.user_id) === input.userId
+      );
+      let paired = false;
+      let reason: TelegramCommandResult["reason"] = "ok";
+      let status: "processed" | "rejected" | "ignored" = "processed";
+      let task: TaskRecord | null = null;
+      const correlationId = randomUUID();
+
+      if (input.action === "pair") {
+        if (!input.pairCodeValid) {
+          reason = "invalid_pairing_code";
+          status = "rejected";
+        } else if (!operator) {
+          await transaction.query(
+            `INSERT INTO telegram_operator (singleton, chat_id, user_id, username)
+             VALUES (true, $1, $2, $3)`,
+            [input.chatId, input.userId, input.username]
+          );
+          await appendEvent(transaction, {
+            type: "telegram.operator_paired",
+            actorType: "human",
+            actorId: `telegram:${input.userId}`,
+            aggregateType: "telegram_operator",
+            aggregateId: "primary",
+            aggregateVersion: 1,
+            correlationId,
+            payload: { chatType: "private" }
+          });
+          authorized = true;
+          paired = true;
+        } else if (!authorized) {
+          reason = "already_paired";
+          status = "rejected";
+        }
+      } else if (!authorized) {
+        reason = "not_paired";
+        status = input.action === "help" ? "ignored" : "rejected";
+      } else if (input.action === "ask" || input.action === "request") {
+        const prompt = input.prompt?.trim();
+        if (!prompt || prompt.length > 4_000) {
+          reason = "invalid_prompt";
+          status = "rejected";
+        } else {
+          let routedPrompt = prompt;
+          let parentRequestId: string | null = null;
+          if (input.action === "request") {
+            const waitingRows = await transaction.query<Row>(
+              `SELECT * FROM telegram_change_requests
+               WHERE chat_id = $1 AND user_id = $2 AND status = 'waiting_clarification'
+               ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+              [input.chatId, input.userId]
+            );
+            const waiting = waitingRows[0];
+            if (waiting) {
+              parentRequestId = asString(waiting.id);
+              routedPrompt = [
+                asString(waiting.request_prompt),
+                "",
+                `Clarification requested: ${asString(waiting.clarification_question)}`,
+                `Operator clarification: ${prompt}`
+              ].join("\n");
+              const updatedRows = await transaction.query<Row>(
+                `UPDATE telegram_change_requests SET
+                   status = 'superseded', aggregate_version = aggregate_version + 1,
+                   updated_at = CURRENT_TIMESTAMP
+                 WHERE id = $1 RETURNING aggregate_version`,
+                [parentRequestId]
+              );
+              await appendEvent(transaction, {
+                type: "telegram.clarification_received",
+                actorType: "human",
+                actorId: `telegram:${input.userId}`,
+                aggregateType: "telegram_change_request",
+                aggregateId: parentRequestId,
+                aggregateVersion: asNumber(updatedRows[0]?.aggregate_version),
+                correlationId,
+                payload: { sourceUpdateId: input.updateId }
+              });
+            }
+          }
+          const objective = routedPrompt.length <= 180
+            ? routedPrompt
+            : `${routedPrompt.slice(0, 177)}...`;
+          task = await enqueueTaskInTransaction(
+            transaction,
+            {
+              kind: input.action === "ask" ? "operator.query" : "operator.request",
+              objective,
+              payload: {
+                prompt: routedPrompt,
+                source: "telegram",
+                sourceUpdateId: input.updateId,
+                telegramChatId: String(input.chatId),
+                telegramUserId: String(input.userId),
+                ...(parentRequestId ? { parentTelegramRequestId: parentRequestId } : {})
+              },
+              dedupeKey: `telegram:update:${input.updateId}`,
+              priority: 40,
+              maxAttempts: 2,
+              risk: "low"
+            },
+            {
+              type: "human",
+              id: `telegram:${input.userId}`,
+              correlationId
+            }
+          );
+        }
+      }
+
+      await transaction.query(
+        `INSERT INTO telegram_updates (
+           update_id, chat_id, user_id, message_id, command, status, task_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [input.updateId, input.chatId, input.userId, input.messageId, input.action, status, task?.id ?? null]
+      );
+      await appendEvent(transaction, {
+        type: `telegram.update_${status}`,
+        actorType: authorized ? "human" : "external",
+        actorId: authorized ? `telegram:${input.userId}` : "telegram:unpaired",
+        aggregateType: "telegram_update",
+        aggregateId: String(input.updateId),
+        aggregateVersion: 1,
+        correlationId,
+        taskId: task?.id ?? null,
+        payload: { command: input.action, reason }
+      });
+
+      return { duplicate: false, authorized, paired, reason, task };
+    });
+  }
+
+  async processTelegramCallback(input: TelegramCallbackInput): Promise<TelegramCallbackResult> {
+    return this.database.transaction(async (transaction) => {
+      const duplicate = await transaction.query<Row>(
+        "SELECT task_id FROM telegram_updates WHERE update_id = $1",
+        [input.updateId]
+      );
+      if (duplicate[0]) {
+        return { duplicate: true, authorized: false, reason: "ok", task: null };
+      }
+
+      const operatorRows = await transaction.query<Row>(
+        "SELECT * FROM telegram_operator WHERE singleton = true FOR UPDATE"
+      );
+      const operator = operatorRows[0];
+      const authorized = Boolean(
+        operator
+        && !operator.revoked_at
+        && asNumber(operator.chat_id) === input.chatId
+        && asNumber(operator.user_id) === input.userId
+      );
+      const correlationId = randomUUID();
+      let reason: TelegramCallbackResult["reason"] = "ok";
+      let task: TaskRecord | null = null;
+      let status: "processed" | "rejected" = "processed";
+
+      if (!authorized) {
+        reason = "not_paired";
+        status = "rejected";
+      } else {
+        const requestRows = await transaction.query<Row>(
+          "SELECT * FROM telegram_change_requests WHERE id = $1 FOR UPDATE",
+          [input.changeRequestId]
+        );
+        const changeRequest = requestRows[0];
+        if (
+          !changeRequest
+          || asNumber(changeRequest.chat_id) !== input.chatId
+          || asNumber(changeRequest.user_id) !== input.userId
+        ) {
+          reason = "request_not_found";
+          status = "rejected";
+        } else if (asString(changeRequest.status) !== "pending_confirmation") {
+          reason = "request_already_decided";
+          status = "rejected";
+        } else if (input.decision === "reject") {
+          const updatedRows = await transaction.query<Row>(
+            `UPDATE telegram_change_requests SET
+               status = 'rejected', aggregate_version = aggregate_version + 1,
+               updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 RETURNING aggregate_version`,
+            [input.changeRequestId]
+          );
+          await appendEvent(transaction, {
+            type: "telegram.change_rejected",
+            actorType: "human",
+            actorId: `telegram:${input.userId}`,
+            aggregateType: "telegram_change_request",
+            aggregateId: input.changeRequestId,
+            aggregateVersion: asNumber(updatedRows[0]?.aggregate_version),
+            correlationId,
+            taskId: asString(changeRequest.source_task_id),
+            payload: { callbackQueryId: input.callbackQueryId }
+          });
+        } else {
+          task = await enqueueTaskInTransaction(
+            transaction,
+            {
+              kind: "repo.update",
+              objective: asString(changeRequest.objective),
+              payload: {
+                prompt: asString(changeRequest.implementation_prompt),
+                source: "telegram",
+                telegramChatId: String(input.chatId),
+                telegramUserId: String(input.userId),
+                telegramChangeRequestId: input.changeRequestId,
+                sourceTaskId: asString(changeRequest.source_task_id)
+              },
+              dedupeKey: `telegram:change:${input.changeRequestId}`,
+              priority: 50,
+              maxAttempts: 3,
+              risk: "medium"
+            },
+            {
+              type: "human",
+              id: `telegram:${input.userId}`,
+              correlationId
+            }
+          );
+          const updatedRows = await transaction.query<Row>(
+            `UPDATE telegram_change_requests SET
+               status = 'enqueued', child_task_id = $2,
+               aggregate_version = aggregate_version + 1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 RETURNING aggregate_version`,
+            [input.changeRequestId, task.id]
+          );
+          await appendEvent(transaction, {
+            type: "telegram.change_approved",
+            actorType: "human",
+            actorId: `telegram:${input.userId}`,
+            aggregateType: "telegram_change_request",
+            aggregateId: input.changeRequestId,
+            aggregateVersion: asNumber(updatedRows[0]?.aggregate_version),
+            correlationId,
+            taskId: task.id,
+            payload: {
+              callbackQueryId: input.callbackQueryId,
+              sourceTaskId: asString(changeRequest.source_task_id)
+            }
+          });
+        }
+      }
+
+      await transaction.query(
+        `INSERT INTO telegram_updates (
+           update_id, chat_id, user_id, message_id, command, status, task_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
-          id,
-          input.kind,
-          input.objective,
-          input.priority ?? 0,
-          input.risk ?? "low",
-          JSON.stringify(input.payload),
-          input.dedupeKey,
-          input.maxAttempts ?? 3
+          input.updateId,
+          input.chatId,
+          input.userId,
+          input.messageId,
+          input.decision,
+          status,
+          task?.id ?? null
         ]
       );
-      const task = taskFromRow(inserted[0] ?? {});
       await appendEvent(transaction, {
-        type: "task.created",
-        actorType: "system",
-        actorId: "task-enqueuer",
-        aggregateType: "task",
-        aggregateId: id,
+        type: `telegram.update_${status}`,
+        actorType: authorized ? "human" : "external",
+        actorId: authorized ? `telegram:${input.userId}` : "telegram:unpaired",
+        aggregateType: "telegram_update",
+        aggregateId: String(input.updateId),
         aggregateVersion: 1,
-        correlationId: randomUUID(),
-        taskId: id,
-        payload: { kind: input.kind, dedupeKey: input.dedupeKey }
+        correlationId,
+        taskId: task?.id ?? null,
+        payload: { command: input.decision, reason, changeRequestId: input.changeRequestId }
       });
-      return task;
+
+      return { duplicate: false, authorized, reason, task };
     });
+  }
+
+  async leaseTelegramOutbox(
+    workerId: string,
+    leaseSeconds: number,
+    correlationId: string = randomUUID()
+  ): Promise<TelegramOutboxRecord | null> {
+    return this.database.transaction(async (transaction) => {
+      const workerRows = await transaction.query<Row>(
+        "SELECT id FROM workers WHERE id = $1 AND revoked_at IS NULL",
+        [workerId]
+      );
+      if (!workerRows[0]) throw new StoreError("worker_not_registered", "Worker is not registered", 403);
+
+      const expiredRows = await transaction.query<Row>(
+        `SELECT * FROM telegram_outbox
+         WHERE status = 'leased' AND lease_expires_at <= CURRENT_TIMESTAMP
+         ORDER BY lease_expires_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`
+      );
+      const expired = expiredRows[0];
+      if (expired) {
+        const updatedRows = await transaction.query<Row>(
+          `UPDATE telegram_outbox SET
+             status = 'delivery_unknown', lease_token = NULL, lease_expires_at = NULL,
+             last_error_code = 'delivery_lease_expired',
+             aggregate_version = aggregate_version + 1, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1 RETURNING aggregate_version`,
+          [expired.id]
+        );
+        await appendEvent(transaction, {
+          type: "telegram.notification_delivery_unknown",
+          actorType: "system",
+          actorId: "telegram-outbox-reconciler",
+          aggregateType: "telegram_outbox",
+          aggregateId: asString(expired.id),
+          aggregateVersion: asNumber(updatedRows[0]?.aggregate_version),
+          correlationId,
+          payload: { reason: "lease_expired", retrySuppressed: true }
+        });
+      }
+
+      const pendingRows = await transaction.query<Row>(
+        `SELECT * FROM telegram_outbox
+         WHERE status = 'pending' AND attempt_count < 3
+         ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`
+      );
+      const pending = pendingRows[0];
+      if (!pending) return null;
+
+      const leaseToken = randomUUID();
+      const leasedRows = await transaction.query<Row>(
+        `UPDATE telegram_outbox SET
+           status = 'leased', attempt_count = attempt_count + 1,
+           lease_token = $2,
+           lease_expires_at = CURRENT_TIMESTAMP + ($3::integer * INTERVAL '1 second'),
+           aggregate_version = aggregate_version + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 RETURNING *`,
+        [pending.id, leaseToken, leaseSeconds]
+      );
+      const leased = telegramOutboxFromRow(leasedRows[0] ?? {});
+      await appendEvent(transaction, {
+        type: "telegram.notification_leased",
+        actorType: "worker",
+        actorId: workerId,
+        aggregateType: "telegram_outbox",
+        aggregateId: leased.id,
+        aggregateVersion: asNumber(leasedRows[0]?.aggregate_version),
+        correlationId,
+        payload: { attempt: leased.attemptCount, leaseExpiresAt: leased.leaseExpiresAt }
+      });
+      return leased;
+    });
+  }
+
+  async completeTelegramOutbox(
+    id: string,
+    workerId: string,
+    completion: TelegramOutboxComplete,
+    correlationId: string = randomUUID()
+  ): Promise<void> {
+    await this.database.transaction(async (transaction) => {
+      const rows = await transaction.query<Row>(
+        "SELECT * FROM telegram_outbox WHERE id = $1 FOR UPDATE",
+        [id]
+      );
+      const current = rows[0];
+      if (!current) throw new StoreError("telegram_outbox_not_found", "Notification does not exist", 404);
+      if (asString(current.status) !== "leased" || asString(current.lease_token) !== completion.leaseToken) {
+        throw new StoreError("telegram_outbox_stale_lease", "Notification lease is no longer active", 409);
+      }
+
+      let status: "sent" | "pending" | "failed" | "delivery_unknown";
+      if (completion.outcome === "sent") {
+        if (completion.telegramMessageId === null) {
+          throw new StoreError("telegram_message_id_required", "Telegram message id is required", 400);
+        }
+        status = "sent";
+      } else if (completion.outcome === "delivery_unknown") {
+        status = "delivery_unknown";
+      } else {
+        status = asNumber(current.attempt_count) < 3 ? "pending" : "failed";
+      }
+
+      const updatedRows = await transaction.query<Row>(
+        `UPDATE telegram_outbox SET
+           status = $2, lease_token = NULL, lease_expires_at = NULL,
+           telegram_message_id = $3, last_error_code = $4,
+           aggregate_version = aggregate_version + 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 RETURNING aggregate_version`,
+        [id, status, completion.telegramMessageId, completion.errorCode]
+      );
+      await appendEvent(transaction, {
+        type: status === "sent"
+          ? "telegram.notification_sent"
+          : status === "pending"
+            ? "telegram.notification_retry_scheduled"
+            : status === "failed"
+              ? "telegram.notification_failed"
+              : "telegram.notification_delivery_unknown",
+        actorType: "worker",
+        actorId: workerId,
+        aggregateType: "telegram_outbox",
+        aggregateId: id,
+        aggregateVersion: asNumber(updatedRows[0]?.aggregate_version),
+        correlationId,
+        payload: {
+          outcome: completion.outcome,
+          errorCode: completion.errorCode,
+          retrySuppressed: status === "delivery_unknown"
+        }
+      });
+    });
+  }
+
+  async telegramTasks(chatId: number, requestedTaskId?: string, limit = 5): Promise<TelegramTaskView[]> {
+    const rows = await this.database.query<Row>(
+      `SELECT * FROM tasks
+       WHERE payload->>'source' = 'telegram'
+         AND payload->>'telegramChatId' = $1
+         AND ($2::text IS NULL OR id::text = $2)
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [String(chatId), requestedTaskId ?? null, Math.max(1, Math.min(limit, 10))]
+    );
+    return Promise.all(rows.map(async (row) => {
+      const task = taskFromRow(row);
+      const runRows = await this.database.query<Row>(
+        "SELECT * FROM runs WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+        [task.id]
+      );
+      return { task, latestRun: runRows[0] ? runFromRow(runRows[0]) : null };
+    }));
   }
 
   async checkLoginRateLimit(fingerprintValue: string): Promise<RateLimitState> {
@@ -604,7 +1196,10 @@ export class Phase0Store {
         [candidate.id, workerId, leaseToken, leaseSeconds]
       );
       const task = taskFromRow(updatedTasks[0] ?? {});
-      const runtime = task.kind === "repo.update" || task.kind.startsWith("phase0.codex")
+      const runtime = task.kind === "repo.update"
+        || task.kind === "operator.query"
+        || task.kind === "operator.request"
+        || task.kind.startsWith("phase0.codex")
         ? "codex-sdk"
         : "deterministic";
       const insertedRuns = await transaction.query<Row>(
@@ -1176,7 +1771,7 @@ export class Phase0Store {
         `SELECT r.*, t.status AS task_status, t.lease_token AS task_lease_token,
            t.lease_expires_at AS task_lease_expires_at,
            t.attempt_count AS task_attempt_count, t.max_attempts AS task_max_attempts,
-           t.kind AS task_kind
+           t.kind AS task_kind, t.payload AS task_payload, t.objective AS task_objective
          FROM runs r JOIN tasks t ON t.id = r.task_id
          WHERE r.id = $1 FOR UPDATE OF r, t`,
         [runId]
@@ -1258,6 +1853,169 @@ export class Phase0Store {
         runId,
         payload: { errorSummary: completion.errorSummary }
       });
+
+      const taskPayload = asObject(current.task_payload);
+      const telegramChatId = taskPayload.source === "telegram"
+        ? Number(taskPayload.telegramChatId)
+        : Number.NaN;
+      if (Number.isSafeInteger(telegramChatId) && taskStatus !== "ready") {
+        const notificationBase = `telegram:task:${task.id}:run:${run.id}`;
+        if (taskStatus === "failed_terminal") {
+          await enqueueTelegramTextInTransaction(transaction, {
+            dedupeKey: `${notificationBase}:failed`,
+            chatId: telegramChatId,
+            text: `La richiesta “${task.objective}” è fallita dopo i tentativi previsti. Controlla la dashboard per i dettagli.`,
+            taskId: task.id,
+            runId: run.id,
+            correlationId
+          });
+        } else if (task.kind === "operator.query") {
+          const response = run.output?.response;
+          await enqueueTelegramTextInTransaction(transaction, {
+            dedupeKey: `${notificationBase}:answer`,
+            chatId: telegramChatId,
+            text: typeof response === "string"
+              ? response
+              : "La risposta è stata completata, ma non contiene testo visualizzabile.",
+            taskId: task.id,
+            runId: run.id,
+            correlationId
+          });
+        } else if (task.kind === "operator.request") {
+          const intent = run.output?.intent;
+          if (intent === "answer" && typeof run.output?.response === "string") {
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:answer`,
+              chatId: telegramChatId,
+              text: run.output.response,
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          } else if (
+            intent === "repo_update"
+            && typeof run.output?.objective === "string"
+            && typeof run.output?.implementationPrompt === "string"
+          ) {
+            const requestId = randomUUID();
+            const telegramUserId = Number(taskPayload.telegramUserId);
+            await transaction.query(
+              `INSERT INTO telegram_change_requests (
+                 id, source_task_id, chat_id, user_id, request_prompt,
+                 objective, implementation_prompt, status
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_confirmation')`,
+              [
+                requestId,
+                task.id,
+                telegramChatId,
+                telegramUserId,
+                asString(taskPayload.prompt),
+                run.output.objective,
+                run.output.implementationPrompt
+              ]
+            );
+            await appendEvent(transaction, {
+              type: "telegram.change_confirmation_requested",
+              actorType: "system",
+              actorId: "operator-request-router",
+              aggregateType: "telegram_change_request",
+              aggregateId: requestId,
+              aggregateVersion: 1,
+              correlationId,
+              taskId: task.id,
+              runId: run.id,
+              payload: { risk: "medium" }
+            });
+            await enqueueTelegramOutboxInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:confirmation`,
+              chatId: telegramChatId,
+              text: [
+                "Ho interpretato la richiesta come modifica del progetto.",
+                "",
+                `Obiettivo: ${run.output.objective}`,
+                "",
+                "Se approvi, il worker modificherà un worktree isolato, eseguirà i controlli e pubblicherà sul branch di automazione."
+              ].join("\n"),
+              replyMarkup: {
+                inline_keyboard: [[
+                  { text: "Approva", callback_data: `change:approve:${requestId}` },
+                  { text: "Annulla", callback_data: `change:reject:${requestId}` }
+                ]]
+              },
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          } else if (intent === "clarification" && typeof run.output?.question === "string") {
+            const requestId = randomUUID();
+            await transaction.query(
+              `INSERT INTO telegram_change_requests (
+                 id, source_task_id, chat_id, user_id, request_prompt,
+                 clarification_question, status
+               ) VALUES ($1, $2, $3, $4, $5, $6, 'waiting_clarification')`,
+              [
+                requestId,
+                task.id,
+                telegramChatId,
+                Number(taskPayload.telegramUserId),
+                asString(taskPayload.prompt),
+                run.output.question
+              ]
+            );
+            await appendEvent(transaction, {
+              type: "telegram.clarification_requested",
+              actorType: "system",
+              actorId: "operator-request-router",
+              aggregateType: "telegram_change_request",
+              aggregateId: requestId,
+              aggregateVersion: 1,
+              correlationId,
+              taskId: task.id,
+              runId: run.id,
+              payload: {}
+            });
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:clarification`,
+              chatId: telegramChatId,
+              text: run.output.question,
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          } else {
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:invalid-routing`,
+              chatId: telegramChatId,
+              text: "Non sono riuscito a interpretare in modo sicuro la richiesta. Riformulala oppure usa /ask per una domanda senza modifiche.",
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          }
+        } else if (task.kind === "repo.update") {
+          const publicationRows = await transaction.query<Row>(
+            `SELECT stage, target_branch, commit_sha FROM git_publications
+             WHERE task_id = $1 LIMIT 1`,
+            [task.id]
+          );
+          const publication = publicationRows[0];
+          const publicationText = asString(publication?.stage) === "no_changes"
+            ? `La modifica “${task.objective}” non ha prodotto cambiamenti da pubblicare.`
+            : [
+                `Modifica completata: ${task.objective}`,
+                `Branch: ${asString(publication?.target_branch)}`,
+                `Commit: ${asString(publication?.commit_sha)}`
+              ].join("\n");
+          await enqueueTelegramTextInTransaction(transaction, {
+            dedupeKey: `${notificationBase}:publication`,
+            chatId: telegramChatId,
+            text: publicationText,
+            taskId: task.id,
+            runId: run.id,
+            correlationId
+          });
+        }
+      }
       return { task, run };
     });
   }
@@ -1525,7 +2283,19 @@ export class Phase0Store {
   }
 
   async dashboardSnapshot(): Promise<DashboardSnapshot> {
-    const [workers, tasks, runs, proposals, events, notionRuns] = await Promise.all([
+    const [
+      workers,
+      tasks,
+      runs,
+      proposals,
+      events,
+      notionRuns,
+      telegramOperators,
+      telegramUpdates,
+      telegramConfirmations,
+      telegramNotifications,
+      telegramNotificationFailures
+    ] = await Promise.all([
       this.database.query<Row>(
         `SELECT *, CASE
            WHEN revoked_at IS NOT NULL THEN 'revoked'
@@ -1537,8 +2307,28 @@ export class Phase0Store {
       this.database.query<Row>("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10"),
       this.database.query<Row>("SELECT * FROM runs ORDER BY created_at DESC LIMIT 10"),
       this.database.query<Row>("SELECT * FROM proposals ORDER BY created_at DESC LIMIT 10"),
-      this.database.query<Row>("SELECT * FROM events ORDER BY occurred_at DESC LIMIT 30"),
-      this.database.query<Row>("SELECT * FROM notion_sample_runs ORDER BY sampled_at DESC LIMIT 1")
+      this.database.query<Row>(
+        "SELECT * FROM events WHERE type <> 'worker.heartbeat' ORDER BY occurred_at DESC LIMIT 30"
+      ),
+      this.database.query<Row>("SELECT * FROM notion_sample_runs ORDER BY sampled_at DESC LIMIT 1"),
+      this.database.query<Row>(
+        "SELECT * FROM telegram_operator WHERE singleton = true AND revoked_at IS NULL LIMIT 1"
+      ),
+      this.database.query<Row>(
+        "SELECT * FROM telegram_updates ORDER BY created_at DESC, update_id DESC LIMIT 1"
+      ),
+      this.database.query<Row>(
+        `SELECT COUNT(*)::integer AS count FROM telegram_change_requests
+         WHERE status IN ('pending_confirmation', 'waiting_clarification')`
+      ),
+      this.database.query<Row>(
+        `SELECT COUNT(*)::integer AS count FROM telegram_outbox
+         WHERE status IN ('pending', 'leased')`
+      ),
+      this.database.query<Row>(
+        `SELECT COUNT(*)::integer AS count FROM telegram_outbox
+         WHERE status IN ('failed', 'delivery_unknown')`
+      )
     ]);
     const worker = workers[0] ? workerFromRow(workers[0]) : null;
     const notionRow = notionRuns[0];
@@ -1557,6 +2347,7 @@ export class Phase0Store {
           sampledAt: null,
           errorCode: null
         };
+    const telegramUpdate = telegramUpdates[0];
 
     return {
       generatedAt: new Date().toISOString(),
@@ -1566,7 +2357,16 @@ export class Phase0Store {
       runs: runs.map(runFromRow),
       proposals: proposals.map(proposalFromRow),
       events: events.map(eventFromRow),
-      notion
+      notion,
+      telegram: {
+        paired: telegramOperators.length > 0,
+        lastUpdateAt: telegramUpdate ? asString(telegramUpdate.created_at) : null,
+        lastCommand: telegramUpdate ? asString(telegramUpdate.command) : null,
+        lastTaskId: telegramUpdate ? asNullableString(telegramUpdate.task_id) : null,
+        pendingConfirmations: asNumber(telegramConfirmations[0]?.count ?? 0),
+        pendingNotifications: asNumber(telegramNotifications[0]?.count ?? 0),
+        failedNotifications: asNumber(telegramNotificationFailures[0]?.count ?? 0)
+      }
     };
   }
 }

@@ -1,6 +1,7 @@
 import { requireDashboardSession } from "@/lib/auth";
 import { getStore } from "@/lib/db";
 import { ProposalCard } from "@/components/proposal-card";
+import { LiveRefresh } from "@/components/live-refresh";
 
 export const dynamic = "force-dynamic";
 
@@ -18,9 +19,16 @@ export default async function DashboardPage() {
   const snapshot = await getStore().dashboardSnapshot();
   const activeTasks = snapshot.tasks.filter((task) => ["ready", "leased", "running"].includes(task.status));
   const pendingProposals = snapshot.proposals.filter((proposal) => proposal.status === "pending");
+  const activeRun = snapshot.worker?.activeRunId
+    ? snapshot.runs.find((run) => run.id === snapshot.worker?.activeRunId) ?? null
+    : null;
+  const activeTask = activeRun
+    ? snapshot.tasks.find((task) => task.id === activeRun.taskId) ?? null
+    : null;
 
   return (
     <main className="dashboard-shell">
+      <LiveRefresh />
       <header className="topbar">
         <div>
           <p className="eyebrow">MeaWorld · Autonomous Company OS</p>
@@ -39,8 +47,8 @@ export default async function DashboardPage() {
       <section className="metric-grid" aria-label="Stato Phase 0">
         <article className="metric-card">
           <p>Mac worker</p>
-          <strong>{snapshot.worker?.status ?? "missing"}</strong>
-          <span>{snapshot.worker ? formatDate(snapshot.worker.lastHeartbeatAt) : "Nessun heartbeat"}</span>
+          <strong>{activeTask ? "running" : snapshot.worker?.status === "online" ? "idle" : snapshot.worker?.status ?? "missing"}</strong>
+          <span>{activeTask ? activeTask.objective : "In attesa di nuove task"}</span>
         </article>
         <article className="metric-card">
           <p>Work queue</p>
@@ -57,6 +65,17 @@ export default async function DashboardPage() {
           <strong>{pendingProposals.length}</strong>
           <span>proposte in attesa</span>
         </article>
+        <article className="metric-card">
+          <p>Telegram operator</p>
+          <strong>{snapshot.telegram.paired ? "paired" : "off"}</strong>
+          <span>{snapshot.telegram.failedNotifications > 0
+            ? `${snapshot.telegram.failedNotifications} notifiche fallite/ambigue`
+            : snapshot.telegram.pendingConfirmations > 0
+              ? `${snapshot.telegram.pendingConfirmations} interazioni richieste · ${snapshot.telegram.pendingNotifications} notifiche in uscita`
+            : snapshot.telegram.lastCommand
+              ? `${snapshot.telegram.lastCommand} · ${formatDate(snapshot.telegram.lastUpdateAt)} · ${snapshot.telegram.pendingNotifications} notifiche in uscita`
+              : "Nessun comando ricevuto"}</span>
+        </article>
       </section>
 
       <div className="dashboard-columns">
@@ -71,19 +90,30 @@ export default async function DashboardPage() {
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th>Task</th><th>Stato</th><th>Tentativo</th><th>Aggiornata</th></tr>
+                <tr><th>Task</th><th>Stato</th><th>Run</th><th>Tentativo</th><th>Aggiornata</th></tr>
               </thead>
               <tbody>
                 {snapshot.tasks.map((task) => (
-                  <tr key={task.id}>
-                    <td><strong>{task.kind}</strong><span>{task.objective}</span></td>
-                    <td><span className={`status-pill status-${task.status}`}>{task.status}</span></td>
-                    <td>{task.attemptCount}/{task.maxAttempts}</td>
-                    <td>{formatDate(task.updatedAt)}</td>
-                  </tr>
+                  (() => {
+                    const run = snapshot.runs.find((candidate) => candidate.taskId === task.id);
+                    const response = run?.output?.response;
+                    return (
+                      <tr key={task.id}>
+                        <td>
+                          <strong>{task.kind}</strong>
+                          <span>{task.objective}</span>
+                          {typeof response === "string" ? <span>Risposta: {response}</span> : null}
+                        </td>
+                        <td><span className={`status-pill status-${task.status}`}>{task.status}</span></td>
+                        <td>{run ? <><strong>{run.status}</strong><span>{run.id}</span></> : "—"}</td>
+                        <td>{task.attemptCount}/{task.maxAttempts}</td>
+                        <td>{formatDate(task.updatedAt)}</td>
+                      </tr>
+                    );
+                  })()
                 ))}
                 {snapshot.tasks.length === 0 ? (
-                  <tr><td colSpan={4} className="empty-state">Nessuna task. Esegui il seed Phase 0.</td></tr>
+                  <tr><td colSpan={5} className="empty-state">Nessuna task. Invia una richiesta dal bot Telegram.</td></tr>
                 ) : null}
               </tbody>
             </table>
@@ -126,8 +156,8 @@ export default async function DashboardPage() {
       </section>
 
       <footer>
-        <span>Snapshot {formatDate(snapshot.generatedAt)}</span>
-        <span>Phase 0 · sample bounded · no external mutations</span>
+        <span>Live · aggiornamento ogni 5 secondi · snapshot {formatDate(snapshot.generatedAt)}</span>
+        <span>Notion read-only · azioni Telegram tracciate</span>
       </footer>
     </main>
   );
