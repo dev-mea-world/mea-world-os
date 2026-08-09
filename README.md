@@ -58,6 +58,8 @@ The launchd template is installed explicitly with `scripts/install-launchd.sh`; 
 
 ## Telegram operator channel
 
-The production dashboard exposes `/api/telegram/webhook` as a bounded operator channel. Configure `TELEGRAM_WEBHOOK_SECRET` and `TELEGRAM_PAIRING_CODE` as sensitive production variables, deploy, then register the HTTPS webhook with Telegram using the same webhook secret. The bot token is needed only for Telegram administration and must not be committed or stored in PostgreSQL.
+The production dashboard exposes `/api/telegram/webhook` as a bounded operator channel. Configure `TELEGRAM_WEBHOOK_SECRET` and `TELEGRAM_PAIRING_CODE` as sensitive production variables, deploy, then register the HTTPS webhook with Telegram using the same webhook secret and allow both `message` and `callback_query` updates. Keep `TELEGRAM_BOT_TOKEN` only in the local worker environment: the worker uses it to drain the durable notification outbox, and it must never be committed, logged, stored in PostgreSQL, or added to Vercel.
+
+Telegram `/ask` runs a read-only question. Free text and `/request` are routed into either an answer, a clarification question, or a proposed repository update. Repository updates require confirmation from the paired operator and then use the isolated, validated Git publication flow. Results are sent automatically while `/result` remains available as a diagnostic fallback.
 
 Only one private chat can be paired. Send `/pair <code>` once, then use `/status`, `/tasks`, `/result [task-id]`, `/ask <question>`, or plain text. Questions become durable `operator.query` tasks and execute locally through Codex in read-only mode with network and side effects disabled. Results are visible in the live dashboard and through `/result`.

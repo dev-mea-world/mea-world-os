@@ -76,7 +76,8 @@ describe("Phase 0 durable store", () => {
     expect(rerun.alreadyApplied).toEqual([
       "0001_phase0.sql",
       "0002_git_publications.sql",
-      "0003_telegram_operator.sql"
+      "0003_telegram_operator.sql",
+      "0004_telegram_requests_outbox.sql"
     ]);
 
     const constraints = await database.query<{ count: number }>(
@@ -223,6 +224,167 @@ describe("Phase 0 durable store", () => {
       lastTaskId: queued.task?.id
     });
     expect(snapshot.events.some((event) => event.type === "worker.heartbeat")).toBe(false);
+  });
+
+  it("persists Telegram change confirmation, outbound delivery, and approved repo work", async () => {
+    await store.processTelegramCommand({
+      updateId: 101,
+      chatId: 501,
+      userId: 601,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    const routed = await store.processTelegramCommand({
+      updateId: 102,
+      chatId: 501,
+      userId: 601,
+      username: "operator",
+      messageId: 2,
+      action: "request",
+      pairCodeValid: false,
+      prompt: "Invia automaticamente le risposte Telegram."
+    });
+    expect(routed.task).toMatchObject({ kind: "operator.request", status: "ready" });
+
+    await registerWorker();
+    const work = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!work) throw new Error("Expected operator request work");
+    await store.startRun(work.run.id, "mac-mini-phase0", work.run.leaseToken);
+    await store.completeRun(work.run.id, "mac-mini-phase0", {
+      leaseToken: work.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "router-thread",
+      output: {
+        intent: "repo_update",
+        objective: "Invia automaticamente le risposte Telegram",
+        implementationPrompt: "Implementa notifiche Telegram durevoli e automatiche."
+      },
+      errorSummary: null
+    });
+
+    const requests = await database.query<{
+      id: string;
+      status: string;
+    }>("SELECT id, status FROM telegram_change_requests");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.status).toBe("pending_confirmation");
+    expect((await store.dashboardSnapshot()).telegram).toMatchObject({
+      pendingConfirmations: 1,
+      pendingNotifications: 1
+    });
+
+    const notification = await store.leaseTelegramOutbox("mac-mini-phase0", 30);
+    expect(notification).toMatchObject({
+      chatId: 501,
+      attemptCount: 1,
+      replyMarkup: {
+        inline_keyboard: [[
+          expect.objectContaining({ text: "Approva" }),
+          expect.objectContaining({ text: "Annulla" })
+        ]]
+      }
+    });
+    if (!notification) throw new Error("Expected Telegram notification");
+    await store.completeTelegramOutbox(notification.id, "mac-mini-phase0", {
+      leaseToken: notification.leaseToken,
+      outcome: "sent",
+      telegramMessageId: 9001,
+      errorCode: null
+    });
+
+    const approved = await store.processTelegramCallback({
+      updateId: 103,
+      callbackQueryId: "callback-103",
+      chatId: 501,
+      userId: 601,
+      messageId: 3,
+      changeRequestId: requests[0]?.id ?? "",
+      decision: "approve"
+    });
+    expect(approved).toMatchObject({
+      duplicate: false,
+      authorized: true,
+      reason: "ok",
+      task: { kind: "repo.update", status: "ready", risk: "medium" }
+    });
+    expect(approved.task?.payload).toMatchObject({
+      source: "telegram",
+      telegramChatId: "501",
+      telegramChangeRequestId: requests[0]?.id
+    });
+
+    const duplicate = await store.processTelegramCallback({
+      updateId: 103,
+      callbackQueryId: "callback-duplicate",
+      chatId: 501,
+      userId: 601,
+      messageId: 3,
+      changeRequestId: requests[0]?.id ?? "",
+      decision: "approve"
+    });
+    expect(duplicate.duplicate).toBe(true);
+    const repoTasks = await database.query<{ count: number }>(
+      "SELECT COUNT(*)::integer AS count FROM tasks WHERE kind = 'repo.update'"
+    );
+    expect(Number(repoTasks[0]?.count)).toBe(1);
+    expect((await store.dashboardSnapshot()).telegram).toMatchObject({
+      pendingConfirmations: 0,
+      pendingNotifications: 0
+    });
+
+    const auditGaps = await database.query(
+      `SELECT aggregate_type, aggregate_id
+       FROM events
+       GROUP BY aggregate_type, aggregate_id
+       HAVING MIN(aggregate_version) <> 1
+          OR MAX(aggregate_version) <> COUNT(*)`
+    );
+    expect(auditGaps).toEqual([]);
+  });
+
+  it("pushes completed Telegram answers through the durable outbox", async () => {
+    await store.processTelegramCommand({
+      updateId: 201,
+      chatId: 701,
+      userId: 801,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    const queued = await store.processTelegramCommand({
+      updateId: 202,
+      chatId: 701,
+      userId: 801,
+      username: "operator",
+      messageId: 2,
+      action: "ask",
+      pairCodeValid: false,
+      prompt: "Dammi una risposta breve."
+    });
+    await registerWorker();
+    const work = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!work) throw new Error("Expected operator query work");
+    await store.startRun(work.run.id, "mac-mini-phase0", work.run.leaseToken);
+    await store.completeRun(work.run.id, "mac-mini-phase0", {
+      leaseToken: work.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "answer-thread",
+      output: { response: "Risposta pronta." },
+      errorSummary: null
+    });
+
+    const notification = await store.leaseTelegramOutbox("mac-mini-phase0", 30);
+    expect(notification).toMatchObject({
+      chatId: 701,
+      text: "Risposta pronta.",
+      replyMarkup: null
+    });
+    expect(queued.task?.id).toBe(work.task.id);
   });
 
   it("leases once under contention and recovers an expired in-flight run", async () => {

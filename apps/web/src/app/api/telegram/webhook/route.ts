@@ -5,12 +5,14 @@ import {
   constantTimeEqual,
   getTelegramEnv,
   parseTelegramCommand,
+  telegramCallbackReply,
   telegramWebhookReply
 } from "@/lib/telegram";
 
 export const dynamic = "force-dynamic";
 
 const taskIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const changeCallbackPattern = /^change:(approve|reject):([a-f0-9-]{36})$/i;
 
 function taskStatusLine(status: string): string {
   const labels: Record<string, string> = {
@@ -35,6 +37,33 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const parsedUpdate = TelegramUpdateSchema.safeParse(await request.json().catch(() => null));
   if (!parsedUpdate.success) return NextResponse.json({ ok: true });
+  const callback = parsedUpdate.data.callback_query;
+  if (callback && !callback.from.is_bot && callback.message?.chat.type === "private") {
+    const match = callback.data ? changeCallbackPattern.exec(callback.data) : null;
+    if (!match || !taskIdPattern.test(match[2] ?? "")) {
+      return NextResponse.json(telegramCallbackReply(callback.id, "Azione non valida o scaduta."));
+    }
+    const result = await getStore().processTelegramCallback({
+      updateId: parsedUpdate.data.update_id,
+      callbackQueryId: callback.id,
+      chatId: callback.message.chat.id,
+      userId: callback.from.id,
+      messageId: callback.message.message_id,
+      changeRequestId: match[2] ?? "",
+      decision: match[1]?.toLowerCase() === "approve" ? "approve" : "reject"
+    });
+    if (result.duplicate) return NextResponse.json({ ok: true });
+    const reply = result.reason === "not_paired"
+      ? "Account non autorizzato."
+      : result.reason === "request_not_found"
+        ? "Richiesta non trovata."
+        : result.reason === "request_already_decided"
+          ? "Questa richiesta è già stata decisa."
+          : result.task
+            ? `Approvata e accodata: ${result.task.id}`
+            : "Richiesta annullata.";
+    return NextResponse.json(telegramCallbackReply(callback.id, reply));
+  }
   const message = parsedUpdate.data.message;
   if (!message?.text || message.from.is_bot) return NextResponse.json({ ok: true });
   if (message.chat.type !== "private") {
@@ -55,7 +84,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     action: command.action,
     pairCodeValid: command.action === "pair"
       && constantTimeEqual(command.argument, telegramEnv.TELEGRAM_PAIRING_CODE),
-    prompt: command.action === "ask" ? command.argument : null
+    prompt: command.action === "ask" || command.action === "request" ? command.argument : null
   });
   if (result.duplicate) return NextResponse.json({ ok: true });
 
@@ -69,10 +98,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   } else if (result.reason === "invalid_prompt") {
     reply = "La richiesta deve contenere da 1 a 4000 caratteri.";
   } else if (result.paired) {
-    reply = "Account associato. Ora puoi usare /status, /tasks, /result oppure scrivere una domanda.";
+    reply = "Account associato. Scrivi normalmente per fare una richiesta; usa /ask per una domanda senza modifiche.";
   } else if (command.action === "help") {
     reply = result.authorized
-      ? "Comandi: /status, /tasks, /result [task-id], /ask domanda. Puoi anche scrivere direttamente una domanda."
+      ? "Comandi: /status, /tasks, /result [task-id], /ask domanda, /request richiesta. Il testo libero viene interpretato e, se implica modifiche, ti chiede conferma."
       : "Per iniziare usa /pair seguito dal codice di associazione.";
   } else if (command.action === "status") {
     const snapshot = await getStore().dashboardSnapshot();
@@ -118,8 +147,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           : `${taskStatusLine(latest.task.status)}: ${latest.task.objective}`;
       }
     }
-  } else if (command.action === "ask" && result.task) {
-    reply = `Task accodata: ${result.task.id}\nSegui l’esecuzione dalla dashboard o usa /result ${result.task.id}`;
+  } else if ((command.action === "ask" || command.action === "request") && result.task) {
+    reply = `Richiesta acquisita: ${result.task.id}\nTi scriverò automaticamente appena avrò una risposta, una domanda o una conferma da chiederti.`;
   } else {
     reply = "Comando non riconosciuto. Usa /help.";
   }

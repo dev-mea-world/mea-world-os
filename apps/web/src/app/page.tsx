@@ -68,9 +68,13 @@ export default async function DashboardPage() {
         <article className="metric-card">
           <p>Telegram operator</p>
           <strong>{snapshot.telegram.paired ? "paired" : "off"}</strong>
-          <span>{snapshot.telegram.lastCommand
-            ? `${snapshot.telegram.lastCommand} · ${formatDate(snapshot.telegram.lastUpdateAt)}`
-            : "Nessun comando ricevuto"}</span>
+          <span>{snapshot.telegram.failedNotifications > 0
+            ? `${snapshot.telegram.failedNotifications} notifiche fallite/ambigue`
+            : snapshot.telegram.pendingConfirmations > 0
+              ? `${snapshot.telegram.pendingConfirmations} interazioni richieste · ${snapshot.telegram.pendingNotifications} notifiche in uscita`
+            : snapshot.telegram.lastCommand
+              ? `${snapshot.telegram.lastCommand} · ${formatDate(snapshot.telegram.lastUpdateAt)} · ${snapshot.telegram.pendingNotifications} notifiche in uscita`
+              : "Nessun comando ricevuto"}</span>
         </article>
       </section>
 

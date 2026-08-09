@@ -65,9 +65,14 @@ describe("Phase 0 security primitives", () => {
   it("requires a same-origin protected mutation and redacts named secrets", () => {
     expect(isAllowedOrigin("https://os.example/api/x", "https://os.example", "https://os.example")).toBe(true);
     expect(isAllowedOrigin("https://os.example/api/x", "https://evil.example", "https://os.example")).toBe(false);
-    expect(redactSecrets({ workerSecret: "sentinel", nested: { notionToken: "sentinel" } })).toEqual({
+    expect(redactSecrets({
+      workerSecret: "sentinel",
+      telegramBotToken: "sentinel",
+      nested: { notionToken: "sentinel", telegramWebhookSecret: "sentinel" }
+    })).toEqual({
       workerSecret: "[REDACTED]",
-      nested: { notionToken: "[REDACTED]" }
+      telegramBotToken: "[REDACTED]",
+      nested: { notionToken: "[REDACTED]", telegramWebhookSecret: "[REDACTED]" }
     });
   });
 });

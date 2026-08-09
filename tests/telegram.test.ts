@@ -2,11 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   constantTimeEqual,
   parseTelegramCommand,
+  telegramCallbackReply,
   telegramWebhookReply
 } from "../apps/web/src/lib/telegram";
 
 describe("Telegram command boundary", () => {
-  it("parses commands, bot suffixes, and plain-text questions", () => {
+  it("parses commands, bot suffixes, and plain-text requests", () => {
     expect(parseTelegramCommand("/status")).toEqual({ action: "status", argument: "" });
     expect(parseTelegramCommand("/result@MeaWorldBot task-id")).toEqual({
       action: "result",
@@ -17,8 +18,12 @@ describe("Telegram command boundary", () => {
       argument: "una domanda"
     });
     expect(parseTelegramCommand("Come stai?")).toEqual({
-      action: "ask",
+      action: "request",
       argument: "Come stai?"
+    });
+    expect(parseTelegramCommand("/request Migliora il bot")).toEqual({
+      action: "request",
+      argument: "Migliora il bot"
     });
     expect(parseTelegramCommand("/unsupported")).toEqual({ action: "unknown", argument: "" });
   });
@@ -39,5 +44,14 @@ describe("Telegram command boundary", () => {
     });
     expect(reply.text).toHaveLength(4_096);
     expect(reply).not.toHaveProperty("parse_mode");
+  });
+
+  it("acknowledges callback decisions without exposing an unbounded response", () => {
+    expect(telegramCallbackReply("callback-id", "x".repeat(500))).toEqual({
+      method: "answerCallbackQuery",
+      callback_query_id: "callback-id",
+      text: "x".repeat(200),
+      show_alert: false
+    });
   });
 });

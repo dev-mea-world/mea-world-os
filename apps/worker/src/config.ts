@@ -29,6 +29,10 @@ const WorkerConfigSchema = z.object({
   WORKER_LEASE_SECONDS: integerFromEnvironment(300, 15, 300),
   NOTION_TOKEN: z.string().optional(),
   NOTION_SAMPLE_LIMIT: integerFromEnvironment(5, 1, 20),
+  TELEGRAM_BOT_TOKEN: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(30).max(256).optional()
+  ),
   CODEX_WORKING_DIRECTORY: z.string().min(1),
   GIT_AUTO_PUBLISH_ENABLED: booleanFromEnvironment(false),
   GIT_REMOTE: z.string().regex(/^[A-Za-z0-9._-]+$/).default("origin"),
@@ -48,6 +52,7 @@ export interface WorkerConfig {
   leaseSeconds: number;
   notionToken: string | undefined;
   notionSampleLimit: number;
+  telegramBotToken: string | undefined;
   codexWorkingDirectory: string;
   gitAutoPublishEnabled: boolean;
   gitRemote: string;
@@ -69,6 +74,7 @@ export function getWorkerConfig(): WorkerConfig {
     leaseSeconds: parsed.WORKER_LEASE_SECONDS,
     notionToken: parsed.NOTION_TOKEN,
     notionSampleLimit: parsed.NOTION_SAMPLE_LIMIT,
+    telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     codexWorkingDirectory: parsed.CODEX_WORKING_DIRECTORY,
     gitAutoPublishEnabled: parsed.GIT_AUTO_PUBLISH_ENABLED,
     gitRemote: parsed.GIT_REMOTE,

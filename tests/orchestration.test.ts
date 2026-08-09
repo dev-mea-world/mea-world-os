@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexSdkRuntime,
@@ -228,6 +229,52 @@ describe("task execution", () => {
     expect(runtime.starts[0]?.prompt).toContain("Do not inspect files");
     expect(runtime.starts[0]?.prompt).toContain("Do not call tools");
     expect(runtime.starts[0]?.prompt).toContain("Che cosa puoi fare?");
+  });
+
+  it("routes Telegram change requests into a strict confirmation decision", async () => {
+    const runtime = new FakeRuntime(JSON.stringify({
+      intent: "repo_update",
+      objective: "Invia automaticamente le risposte Telegram",
+      implementationPrompt: "Implementa una outbox Telegram durevole e notifiche automatiche."
+    }));
+    const result = await executeTask({
+      task: taskWith("operator.request", {
+        prompt: "Migliora il bot e inviami automaticamente le risposte."
+      }),
+      runId: "a7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime,
+      workingDirectory: "/tmp/operator-context"
+    });
+
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        intent: "repo_update",
+        objective: "Invia automaticamente le risposte Telegram"
+      }
+    });
+    expect(runtime.starts[0]).toMatchObject({
+      sandboxMode: "read-only",
+      networkAccessEnabled: false
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Use repo_update when the operator asks");
+    expect(runtime.starts[0]?.prompt).toContain("Migliora il bot");
+  });
+
+  it("fails closed when Telegram request routing returns non-JSON or extra fields", async () => {
+    for (const response of [
+      "I would change the repository",
+      JSON.stringify({ intent: "answer", response: "ok", extra: true })
+    ]) {
+      const result = await executeTask({
+        task: taskWith("operator.request", { prompt: "Richiesta" }),
+        runId: randomUUID(),
+        runtime: new FakeRuntime(response),
+        workingDirectory: "/tmp/operator-context"
+      });
+      expect(result.outcome).toBe("failed_retryable");
+      expect(result.output).not.toHaveProperty("response");
+    }
   });
 
   it.each([

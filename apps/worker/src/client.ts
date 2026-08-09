@@ -6,6 +6,8 @@ import type {
   LeasedWork,
   RunComplete,
   RunRecord,
+  TelegramOutboxComplete,
+  TelegramOutboxRecord,
   WorkerRecord
 } from "@meaworld/domain";
 import { workerSignature } from "@meaworld/security";
@@ -95,6 +97,18 @@ export class WorkerApiClient {
 
   completeRun(runId: string, completion: RunComplete, correlationId?: string): Promise<unknown> {
     return this.post(`/api/runs/${runId}/complete`, completion, correlationId);
+  }
+
+  leaseTelegramOutbox(leaseSeconds: number): Promise<{ notification: TelegramOutboxRecord | null }> {
+    return this.post("/api/telegram/outbox/lease", { leaseSeconds });
+  }
+
+  completeTelegramOutbox(
+    id: string,
+    completion: TelegramOutboxComplete,
+    correlationId?: string
+  ): Promise<{ ok: true }> {
+    return this.post(`/api/telegram/outbox/${id}/complete`, completion, correlationId);
   }
 
   recordGitPublication(

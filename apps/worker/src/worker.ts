@@ -157,9 +157,82 @@ export class Phase0Worker {
     }
   }
 
+  async processOneTelegramNotification(): Promise<boolean> {
+    const botToken = this.config.telegramBotToken;
+    if (!botToken) return false;
+    const { notification } = await this.client.leaseTelegramOutbox(30);
+    if (!notification) return false;
+
+    const correlationId = randomUUID();
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: notification.chatId,
+          text: notification.text.slice(0, 4_096),
+          link_preview_options: { is_disabled: true },
+          ...(notification.replyMarkup ? { reply_markup: notification.replyMarkup } : {})
+        }),
+        signal: AbortSignal.timeout(15_000)
+      });
+      const body = await response.json().catch(() => null) as {
+        ok?: boolean;
+        result?: { message_id?: number };
+      } | null;
+      const messageId = body?.ok === true && Number.isSafeInteger(body.result?.message_id)
+        ? body.result?.message_id ?? null
+        : null;
+      if (response.ok && messageId !== null) {
+        await this.client.completeTelegramOutbox(notification.id, {
+          leaseToken: notification.leaseToken,
+          outcome: "sent",
+          telegramMessageId: messageId,
+          errorCode: null
+        }, correlationId);
+        log({
+          level: "info",
+          event: "telegram.notification_sent",
+          message: "Telegram notification delivery persisted",
+          data: { outboxId: notification.id, attempt: notification.attemptCount }
+        });
+      } else if (!response.ok) {
+        await this.client.completeTelegramOutbox(notification.id, {
+          leaseToken: notification.leaseToken,
+          outcome: "retryable_failure",
+          telegramMessageId: null,
+          errorCode: `telegram_http_${response.status}`
+        }, correlationId);
+      } else {
+        await this.client.completeTelegramOutbox(notification.id, {
+          leaseToken: notification.leaseToken,
+          outcome: "delivery_unknown",
+          telegramMessageId: null,
+          errorCode: "telegram_response_invalid"
+        }, correlationId);
+      }
+    } catch {
+      await this.client.completeTelegramOutbox(notification.id, {
+        leaseToken: notification.leaseToken,
+        outcome: "delivery_unknown",
+        telegramMessageId: null,
+        errorCode: "telegram_delivery_unknown"
+      }, correlationId);
+      log({
+        level: "warn",
+        event: "telegram.notification_delivery_unknown",
+        message: "Telegram delivery outcome is unknown; automatic retry was suppressed",
+        data: { outboxId: notification.id }
+      });
+    }
+    return true;
+  }
+
   async runOnce(): Promise<void> {
     await this.heartbeat();
+    await this.processOneTelegramNotification();
     await this.processOneTask();
+    await this.processOneTelegramNotification();
     await this.heartbeat();
   }
 
@@ -199,8 +272,9 @@ export class Phase0Worker {
     try {
       while (!this.stopping) {
         try {
+          const notified = await this.processOneTelegramNotification();
           const processed = await this.processOneTask();
-          if (!processed) await sleep(Math.min(this.config.heartbeatIntervalMs, 10_000));
+          if (!processed && !notified) await sleep(Math.min(this.config.heartbeatIntervalMs, 10_000));
         } catch (error) {
           log({
             level: "error",
