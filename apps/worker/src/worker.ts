@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { CodexSdkRuntime, type AgentRuntime } from "@meaworld/codex";
+import { NotionResearchError, researchNotion } from "@meaworld/notion";
 import { log } from "@meaworld/observability";
 import { executeTask } from "@meaworld/orchestration";
 import { WorkerApiClient } from "./client.js";
@@ -117,6 +118,13 @@ export class Phase0Worker {
               correlationId,
               runtime: this.runtime
             })
+          : work.task.kind === "notion.research"
+            ? await this.executeNotionResearch({
+                task: work.task,
+                runId: work.run.id,
+                leaseToken: work.run.leaseToken,
+                correlationId
+              })
           : await executeTask({
               task: work.task,
               runId: work.run.id,
@@ -154,6 +162,70 @@ export class Phase0Worker {
           message: error instanceof Error ? error.message : "Unknown worker heartbeat error"
         });
       });
+    }
+  }
+
+  private async executeNotionResearch(input: {
+    task: Parameters<typeof executeTask>[0]["task"];
+    runId: string;
+    leaseToken: string;
+    correlationId: string;
+  }): Promise<Awaited<ReturnType<typeof executeTask>>> {
+    if (!this.config.notionToken) {
+      return {
+        outcome: "failed_terminal",
+        runtimeThreadId: null,
+        output: null,
+        errorSummary: "Notion research is not configured"
+      };
+    }
+    const queries = input.task.payload.searchQueries;
+    if (!Array.isArray(queries) || !queries.every((query) => typeof query === "string")) {
+      return {
+        outcome: "failed_terminal",
+        runtimeThreadId: null,
+        output: null,
+        errorSummary: "Notion research queries are invalid"
+      };
+    }
+    try {
+      await this.client.checkpoint(input.runId, input.leaseToken, {
+        stage: "notion_research_collecting",
+        queryCount: queries.length,
+        recordedAt: new Date().toISOString()
+      }, input.correlationId);
+      const research = await researchNotion(
+        this.config.notionToken,
+        queries,
+        {
+          maxPages: this.config.notionResearchMaxPages,
+          maxCharacters: this.config.notionResearchMaxCharacters
+        }
+      );
+      await this.client.checkpoint(input.runId, input.leaseToken, {
+        stage: "notion_research_collected",
+        fetchedPages: research.coverage.fetchedPages,
+        inaccessiblePages: research.coverage.inaccessiblePages,
+        partial: research.coverage.partial,
+        recordedAt: new Date().toISOString()
+      }, input.correlationId);
+      return executeTask({
+        task: input.task,
+        runId: input.runId,
+        runtime: this.runtime,
+        workingDirectory: this.config.codexWorkingDirectory,
+        notionResearch: research
+      });
+    } catch (error) {
+      const retryable = error instanceof NotionResearchError ? error.retryable : true;
+      return {
+        outcome: retryable ? "failed_retryable" : "failed_terminal",
+        runtimeThreadId: null,
+        output: null,
+        errorSummary: error instanceof NotionResearchError
+          ? error.code
+          : "Notion research collection failed"
+      };
     }
   }
 

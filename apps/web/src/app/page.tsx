@@ -32,7 +32,7 @@ export default async function DashboardPage() {
       <header className="topbar">
         <div>
           <p className="eyebrow">MeaWorld · Autonomous Company OS</p>
-          <h1>Foundation control plane</h1>
+          <h1>Supervisor control plane</h1>
         </div>
         <div className="topbar-actions">
           <span className={`system-state state-${snapshot.systemStatus}`}>
@@ -97,11 +97,22 @@ export default async function DashboardPage() {
                   (() => {
                     const run = snapshot.runs.find((candidate) => candidate.taskId === task.id);
                     const response = run?.output?.response;
+                    const sources = Array.isArray(run?.output?.sources) ? run.output.sources : [];
+                    const confidence = run?.output?.confidence;
+                    const coverage = run?.output?.coverage;
+                    const partial = coverage && typeof coverage === "object" && "partial" in coverage
+                      ? coverage.partial === true
+                      : false;
                     return (
                       <tr key={task.id}>
                         <td>
                           <strong>{task.kind}</strong>
                           <span>{task.objective}</span>
+                          {sources.length > 0 ? (
+                            <span>
+                              Ricerca Notion: {sources.length} fonti · confidenza {typeof confidence === "number" ? `${Math.round(confidence * 100)}%` : "—"} · {partial ? "copertura parziale" : "copertura entro i limiti"}
+                            </span>
+                          ) : null}
                           {typeof response === "string" ? <span>Risposta: {response}</span> : null}
                         </td>
                         <td><span className={`status-pill status-${task.status}`}>{task.status}</span></td>

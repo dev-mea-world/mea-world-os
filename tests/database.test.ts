@@ -247,7 +247,7 @@ describe("Phase 0 durable store", () => {
       pairCodeValid: false,
       prompt: "Invia automaticamente le risposte Telegram."
     });
-    expect(routed.task).toMatchObject({ kind: "operator.request", status: "ready" });
+    expect(routed.task).toMatchObject({ kind: "supervisor.request", status: "ready" });
 
     await registerWorker();
     const work = await store.leaseNextTask("mac-mini-phase0", 300);
@@ -385,6 +385,135 @@ describe("Phase 0 durable store", () => {
       replyMarkup: null
     });
     expect(queued.task?.id).toBe(work.task.id);
+  });
+
+  it("executes supervisor Notion research and answers follow-up status from durable context", async () => {
+    await store.processTelegramCommand({
+      updateId: 301,
+      chatId: 901,
+      userId: 902,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    const requested = await store.processTelegramCommand({
+      updateId: 302,
+      chatId: 901,
+      userId: 902,
+      username: "operator",
+      messageId: 2,
+      action: "request",
+      pairCodeValid: false,
+      prompt: "Analizza su Notion pipeline, formazione e processi commerciali."
+    });
+    expect(requested.task).toMatchObject({
+      kind: "notion.research",
+      payload: {
+        searchQueries: ["pipeline", "formazione", "processi", "commerciali"]
+      }
+    });
+
+    await registerWorker();
+    const researchTaskId = requested.task?.id ?? "";
+    const researchWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!researchWork) throw new Error("Expected Notion research work");
+    expect(researchWork.task.id).toBe(researchTaskId);
+    await store.startRun(researchWork.run.id, "mac-mini-phase0", researchWork.run.leaseToken);
+    await store.completeRun(researchWork.run.id, "mac-mini-phase0", {
+      leaseToken: researchWork.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "research-thread",
+      output: {
+        response: "La pipeline include qualificazione e follow-up [N1]. Sintesi AI non validata.",
+        confidence: 0.75,
+        validationState: "ai_generated_unvalidated",
+        sources: [{
+          reference: "N1",
+          externalId: "notion-page-commerciale",
+          title: "Pipeline Commerciale",
+          url: "https://notion.so/pipeline",
+          lastEditedAt: "2026-08-08T10:00:00.000Z",
+          contentHash: "a".repeat(64),
+          matchedQueries: ["Pipeline Commerciale"],
+          partial: false
+        }],
+        coverage: {
+          requestedQueries: ["Pipeline Commerciale"],
+          searchResultCount: 1,
+          uniquePagesFound: 1,
+          fetchedPages: 1,
+          inaccessiblePages: 0,
+          partial: false,
+          limits: { maxPages: 15, maxCharacters: 60_000 }
+        }
+      },
+      errorSummary: null
+    });
+
+    const sourceRows = await database.query<{
+      external_id: string;
+      content_hash: string;
+      metadata: Record<string, unknown>;
+    }>("SELECT external_id, content_hash, metadata FROM source_objects WHERE external_id = $1", [
+      "notion-page-commerciale"
+    ]);
+    expect(sourceRows).toHaveLength(1);
+    expect(sourceRows[0]).toMatchObject({
+      external_id: "notion-page-commerciale",
+      content_hash: "a".repeat(64)
+    });
+
+    const followUp = await store.processTelegramCommand({
+      updateId: 303,
+      chatId: 901,
+      userId: 902,
+      username: "operator",
+      messageId: 3,
+      action: "request",
+      pairCodeValid: false,
+      prompt: "Quindi lo hai fatto?"
+    });
+    const context = followUp.task?.payload.conversationContext;
+    expect(followUp.task).toMatchObject({
+      kind: "supervisor.status",
+      payload: { targetTaskId: researchTaskId }
+    });
+    expect(context).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        taskId: researchTaskId,
+        kind: "notion.research",
+        status: "succeeded",
+        responsePreview: expect.stringContaining("qualificazione")
+      })
+    ]));
+
+    const statusWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!statusWork) throw new Error("Expected status supervisor work");
+    await store.startRun(statusWork.run.id, "mac-mini-phase0", statusWork.run.leaseToken);
+    await store.completeRun(statusWork.run.id, "mac-mini-phase0", {
+      leaseToken: statusWork.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "status-thread",
+      output: { intent: "task_status", taskId: researchTaskId },
+      errorSummary: null
+    });
+
+    const outboxRows = await database.query<{ text: string }>(
+      "SELECT text FROM telegram_outbox WHERE chat_id = 901 ORDER BY created_at"
+    );
+    expect(outboxRows.some(({ text }) => text.includes("La pipeline include qualificazione"))).toBe(true);
+    expect(outboxRows.some(({ text }) => text.startsWith("Sì.") && text.includes("qualificazione"))).toBe(true);
+
+    const auditGaps = await database.query(
+      `SELECT aggregate_type, aggregate_id
+       FROM events
+       GROUP BY aggregate_type, aggregate_id
+       HAVING MIN(aggregate_version) <> 1
+          OR MAX(aggregate_version) <> COUNT(*)`
+    );
+    expect(auditGaps).toEqual([]);
   });
 
   it("leases once under contention and recovers an expired in-flight run", async () => {
