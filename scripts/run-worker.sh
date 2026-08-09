@@ -10,9 +10,5 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-set -a
-source "$ENV_FILE"
-set +a
-
 cd "$REPO_ROOT"
-exec pnpm worker:daemon
+exec node --env-file="$ENV_FILE" --import tsx apps/worker/src/index.ts daemon
