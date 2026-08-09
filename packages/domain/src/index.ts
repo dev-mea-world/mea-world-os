@@ -24,6 +24,15 @@ export const runStatuses = [
   "cancelled"
 ] as const;
 
+export const repositoryMutationTaskKinds = [
+  "repo.update",
+  "failure.remediation"
+] as const;
+
+export function isRepositoryMutationTaskKind(kind: string): boolean {
+  return (repositoryMutationTaskKinds as readonly string[]).includes(kind);
+}
+
 export const proposalStatuses = ["pending", "approved", "rejected", "superseded"] as const;
 
 export type TaskStatus = (typeof taskStatuses)[number];

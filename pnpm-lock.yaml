@@ -75,6 +75,9 @@ importers:
       '@meaworld/codex':
         specifier: workspace:*
         version: link:../../packages/codex
+      '@meaworld/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@meaworld/domain':
         specifier: workspace:*
         version: link:../../packages/domain

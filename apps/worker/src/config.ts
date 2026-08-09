@@ -20,6 +20,7 @@ const booleanFromEnvironment = (fallback: boolean) =>
   });
 
 const WorkerConfigSchema = z.object({
+  DATABASE_URL: z.string().url(),
   WORKER_BASE_URL: z.string().url(),
   WORKER_ID: z.string().min(1).max(128),
   WORKER_DISPLAY_NAME: z.string().min(1).max(128).default("Mac mini Phase 0"),
@@ -45,6 +46,7 @@ const WorkerConfigSchema = z.object({
 });
 
 export interface WorkerConfig {
+  databaseUrl: string;
   baseUrl: string;
   id: string;
   displayName: string;
@@ -69,6 +71,7 @@ export interface WorkerConfig {
 export function getWorkerConfig(): WorkerConfig {
   const parsed = WorkerConfigSchema.parse(process.env);
   return {
+    databaseUrl: parsed.DATABASE_URL,
     baseUrl: parsed.WORKER_BASE_URL,
     id: parsed.WORKER_ID,
     displayName: parsed.WORKER_DISPLAY_NAME,

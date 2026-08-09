@@ -11,4 +11,4 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 cd "$REPO_ROOT"
-exec node --env-file="$ENV_FILE" --import tsx apps/worker/src/index.ts daemon
+exec node scripts/worker-supervisor.mjs

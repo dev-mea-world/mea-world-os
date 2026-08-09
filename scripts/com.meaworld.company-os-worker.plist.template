@@ -6,27 +6,29 @@
   <string>com.meaworld.company-os-worker</string>
   <key>ProgramArguments</key>
   <array>
-    <string>__REPO_ROOT__/scripts/run-worker.sh</string>
+    <string>__NODE_BIN__</string>
+    <string>__RUNTIME_REPO__/scripts/worker-supervisor.mjs</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>__REPO_ROOT__</string>
+  <string>__RUNTIME_REPO__</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>__RUNTIME_PATH__</string>
+    <key>MEAWORLD_WORKER_RUNTIME_DIRECTORY</key>
+    <string>__RUNTIME_REPO__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>__REPO_ROOT__/.phase0/worker.stdout.log</string>
+  <string>__RUNTIME_REPO__/.phase0/worker.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>__REPO_ROOT__/.phase0/worker.stderr.log</string>
+  <string>__RUNTIME_REPO__/.phase0/worker.stderr.log</string>
 </dict>
 </plist>

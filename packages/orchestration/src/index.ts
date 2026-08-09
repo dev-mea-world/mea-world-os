@@ -1,5 +1,5 @@
 import type { AgentRuntime } from "@meaworld/codex";
-import type { TaskRecord } from "@meaworld/domain";
+import { isRepositoryMutationTaskKind, type TaskRecord } from "@meaworld/domain";
 
 export interface TaskExecutionResult {
   outcome: "succeeded" | "failed_retryable" | "failed_terminal";
@@ -400,7 +400,7 @@ export async function executeTask(input: {
     }
   }
 
-  if (input.task.kind === "repo.update") {
+  if (isRepositoryMutationTaskKind(input.task.kind)) {
     const prompt = input.task.payload.prompt;
     if (
       typeof prompt !== "string"

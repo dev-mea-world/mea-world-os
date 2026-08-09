@@ -42,7 +42,13 @@ async function createRepository(): Promise<{
   git(temporaryDirectory, ["init", "--bare", remote]);
   git(temporaryDirectory, ["init", "--initial-branch=main", repository]);
   await writeFile(join(repository, ".gitignore"), ".phase0/\nnode_modules/\n", "utf8");
+  await writeFile(join(repository, ".env.example"), "WORKER_SECRET=\nNOTION_TOKEN=\n", "utf8");
   await writeFile(join(repository, "README.md"), "baseline\n", "utf8");
+  await writeFile(
+    join(repository, "config.ts"),
+    "const schema = { WORKER_SECRET: z.string().min(32) };\n",
+    "utf8"
+  );
   await mkdir(join(repository, "node_modules"));
   await mkdir(join(repository, "packages", "library"), { recursive: true });
   await mkdir(join(repository, "packages", "consumer", "node_modules", "@meaworld"), { recursive: true });
@@ -62,7 +68,7 @@ async function createRepository(): Promise<{
     join(repository, "packages", "consumer", "node_modules", "@meaworld", "library"),
     "dir"
   );
-  git(repository, ["add", ".gitignore", "README.md", "packages"]);
+  git(repository, ["add", ".env.example", ".gitignore", "README.md", "config.ts", "packages"]);
   git(repository, [
     "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
     "commit", "-m", "initial"
@@ -194,6 +200,31 @@ describe("automatic Git publisher", () => {
       retryable: false
     });
     expect(git(fixture.repository, ["ls-remote", "--heads", "origin", "refs/heads/automation/phase0-updates"])).toBe("");
+  });
+
+  hostSandboxIt("allows blank env examples and existing credential schema declarations", async () => {
+    const fixture = await createRepository();
+    temporaryDirectories.push(fixture.temporaryDirectory);
+    const subject = publisher(fixture.repository);
+    const baseSha = await subject.resolveBase();
+    const workspace = await subject.prepareWorkspace({ taskId: TASK_THREE, runId: RUN_ONE, baseSha });
+    await writeFile(
+      join(workspace.path, ".env.example"),
+      "WORKER_SECRET=\nNOTION_TOKEN=\nNEW_OPTION=\n",
+      "utf8"
+    );
+    await writeFile(
+      join(workspace.path, "config.ts"),
+      "const schema = { WORKER_SECRET: z.string().min(32), NEW_OPTION: z.string().optional() };\n",
+      "utf8"
+    );
+
+    await expect(subject.validateAndCommit({
+      taskId: TASK_THREE,
+      runId: RUN_ONE,
+      workspace,
+      expectedBaseSha: baseSha
+    })).resolves.toMatchObject({ status: "committed" });
   });
 
   it("rejects dependency paths created during the repository update", async () => {

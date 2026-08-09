@@ -203,6 +203,26 @@ describe("task execution", () => {
     expect(runtime.starts[0]?.prompt).toContain("for a separate verifier");
   });
 
+  it("runs failure remediation through the same bounded repository mutation contract", async () => {
+    const runtime = new FakeRuntime("recovery complete");
+    const result = await executeTask({
+      task: taskWith("failure.remediation", {
+        prompt: "Fix the deterministic publisher failure and complete the source task."
+      }),
+      runId: "d91610cb-0ed4-4e82-8319-4841019ed35a",
+      runtime,
+      workingDirectory: "/tmp/recovery-worktree"
+    });
+
+    expect(result.outcome).toBe("succeeded");
+    expect(runtime.starts[0]).toMatchObject({
+      workingDirectory: "/tmp/recovery-worktree",
+      sandboxMode: "workspace-write",
+      networkAccessEnabled: false
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Fix the deterministic publisher failure");
+  });
+
   it("runs Telegram operator queries read-only without tools or network", async () => {
     const runtime = new FakeRuntime("Risposta concisa");
     const result = await executeTask({

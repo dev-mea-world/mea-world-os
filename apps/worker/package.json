@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@meaworld/codex": "workspace:*",
+    "@meaworld/db": "workspace:*",
     "@meaworld/domain": "workspace:*",
     "@meaworld/git": "workspace:*",
     "@meaworld/notion": "workspace:*",

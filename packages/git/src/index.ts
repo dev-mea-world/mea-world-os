@@ -312,12 +312,20 @@ function sensitivePath(path: string): boolean {
 }
 
 function containsLikelySecret(content: string): boolean {
+  const credentialKey = "(?:NOTION_TOKEN|WORKER_SECRET|SESSION_SECRET|DASHBOARD_ACCESS_CODE|OPENAI_API_KEY|GITHUB_TOKEN|API_KEY|PASSWORD)";
   const patterns = [
     /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
     /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
     /\bsecret_[A-Za-z0-9]{20,}\b/,
     /\bAKIA[0-9A-Z]{16}\b/,
-    /(?:^|[\s"'`])(?:NOTION_TOKEN|WORKER_SECRET|SESSION_SECRET|DASHBOARD_ACCESS_CODE|OPENAI_API_KEY|GITHUB_TOKEN|API_KEY|PASSWORD)\s*[:=]\s*["']?[^\s"']{8,}/im
+    new RegExp(
+      `(?:^|[\\s"'\`])${credentialKey}[ \\t]*=[ \\t]*["']?[^\\s"']{8,}`,
+      "im"
+    ),
+    new RegExp(
+      `(?:^|[\\s{,])['"]?${credentialKey}['"]?[ \\t]*:[ \\t]*['"\`][^\\r\\n'"\`]{8,}['"\`]`,
+      "im"
+    )
   ];
   return patterns.some((pattern) => pattern.test(content));
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { computeProposalHash, type ProposalHashInput } from "@meaworld/approvals";
+import { isRepositoryMutationTaskKind } from "@meaworld/domain";
 import type {
   DashboardSnapshot,
   EventRecord,
@@ -290,6 +291,146 @@ interface TaskEnqueueActor {
   correlationId: string;
 }
 
+const MAX_AUTOMATIC_REMEDIATION_DEPTH = 1;
+const REMEDIATION_BATCH_SIZE = 5;
+
+function boundedText(value: unknown, maximum: number): string {
+  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+
+function remediationDepth(payload: Record<string, unknown>): number {
+  const value = payload.remediationDepth;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function remediationPrompt(
+  sourceTask: TaskRecord,
+  sourceRunId: string,
+  sourceErrorSummary: string | null
+): string {
+  const originalPrompt = boundedText(sourceTask.payload.prompt, 12_000);
+  return [
+    "Act as the bounded recovery agent for a terminal MeaWorld Company OS task failure.",
+    "Diagnose the failure from the repository and the durable evidence below, implement the smallest safe correction, and run relevant tests.",
+    "If the source task requested a repository change, also complete that original change so the operator does not need to ask again.",
+    "Do not suppress checks, weaken governance, invent credentials, expose secrets, or retry indefinitely.",
+    "If code cannot safely resolve the cause, add only a precise, actionable capability/setup record or runbook improvement; do not claim the source action succeeded.",
+    "",
+    `Source task ID: ${sourceTask.id}`,
+    `Source run ID: ${sourceRunId}`,
+    `Source task kind: ${sourceTask.kind}`,
+    `Source objective: ${boundedText(sourceTask.objective, 1_000)}`,
+    `Terminal error: ${boundedText(sourceErrorSummary, 2_000) || "unspecified_terminal_failure"}`,
+    ...(originalPrompt ? ["", "Original authorized task prompt:", originalPrompt] : [])
+  ].join("\n").slice(0, 19_500);
+}
+
+async function enqueueTerminalFailureRemediation(
+  database: Database,
+  sourceTask: TaskRecord,
+  sourceRunId: string,
+  sourceErrorSummary: string | null,
+  correlationId: string
+): Promise<{ task: TaskRecord | null; created: boolean }> {
+  if (
+    sourceTask.kind === "failure.remediation"
+    || remediationDepth(sourceTask.payload) >= MAX_AUTOMATIC_REMEDIATION_DEPTH
+  ) return { task: null, created: false };
+
+  const dedupeKey = `failure-remediation:run:${sourceRunId}`;
+  const existing = await database.query<Row>(
+    "SELECT * FROM tasks WHERE dedupe_key = $1 FOR UPDATE",
+    [dedupeKey]
+  );
+  if (existing[0]) return { task: taskFromRow(existing[0]), created: false };
+
+  const sourceChatId = boundedText(sourceTask.payload.telegramChatId, 32);
+  const sourceUserId = boundedText(sourceTask.payload.telegramUserId, 32);
+  const remediation = await enqueueTaskInTransaction(
+    database,
+    {
+      kind: "repo.update",
+      objective: `Resolve terminal failure for: ${sourceTask.objective}`.slice(0, 1_000),
+      payload: {
+        prompt: remediationPrompt(sourceTask, sourceRunId, sourceErrorSummary),
+        source: sourceChatId ? "telegram" : "system",
+        sourceTaskId: sourceTask.id,
+        sourceRunId,
+        sourceTaskKind: sourceTask.kind,
+        sourceErrorSummary,
+        automaticRemediation: true,
+        remediationDepth: remediationDepth(sourceTask.payload) + 1,
+        ...(sourceChatId ? { telegramChatId: sourceChatId } : {}),
+        ...(sourceUserId ? { telegramUserId: sourceUserId } : {})
+      },
+      dedupeKey,
+      priority: Math.min(Math.max(sourceTask.priority + 10, 80), 1_000),
+      maxAttempts: 2,
+      risk: "medium"
+    },
+    { type: "system", id: "failure-reconciler", correlationId }
+  );
+  await appendEvent(database, {
+    type: "remediation.requested",
+    actorType: "system",
+    actorId: "failure-reconciler",
+    aggregateType: "remediation",
+    aggregateId: remediation.id,
+    aggregateVersion: 1,
+    correlationId,
+    taskId: remediation.id,
+    runId: sourceRunId,
+    payload: {
+      sourceTaskId: sourceTask.id,
+      sourceRunId,
+      errorSummary: sourceErrorSummary,
+      depth: remediation.payload.remediationDepth
+    }
+  });
+  return { task: remediation, created: true };
+}
+
+async function reconcileTerminalFailureRemediationsInTransaction(
+  database: Database,
+  correlationId: string
+): Promise<TaskRecord[]> {
+  const candidates = await database.query<Row>(
+    `SELECT t.*, terminal_run.id AS source_run_id,
+       terminal_run.error_summary AS source_error_summary
+     FROM tasks t
+     JOIN LATERAL (
+       SELECT id, error_summary
+       FROM runs
+       WHERE task_id = t.id AND status = 'failed_terminal'
+       ORDER BY attempt DESC
+       LIMIT 1
+     ) terminal_run ON true
+     WHERE t.status = 'failed_terminal'
+       AND t.kind <> 'failure.remediation'
+       AND COALESCE(t.payload->>'remediationDepth', '0') = '0'
+       AND NOT EXISTS (
+         SELECT 1 FROM tasks remediation
+         WHERE remediation.dedupe_key = 'failure-remediation:run:' || terminal_run.id::text
+       )
+     ORDER BY t.updated_at DESC
+     FOR UPDATE OF t SKIP LOCKED
+     LIMIT $1`,
+    [REMEDIATION_BATCH_SIZE]
+  );
+  const remediations: TaskRecord[] = [];
+  for (const candidate of candidates) {
+    const remediation = await enqueueTerminalFailureRemediation(
+      database,
+      taskFromRow(candidate),
+      asString(candidate.source_run_id),
+      asNullableString(candidate.source_error_summary),
+      correlationId
+    );
+    if (remediation.created && remediation.task) remediations.push(remediation.task);
+  }
+  return remediations;
+}
+
 export type TelegramCommandAction =
   | "pair"
   | "help"
@@ -560,6 +701,14 @@ function explicitTaskStatusTarget(
 
 export class Phase0Store {
   constructor(private readonly database: Database) {}
+
+  async reconcileTerminalFailureRemediations(
+    correlationId: string = randomUUID()
+  ): Promise<TaskRecord[]> {
+    return this.database.transaction((transaction) =>
+      reconcileTerminalFailureRemediationsInTransaction(transaction, correlationId)
+    );
+  }
 
   async enqueueTask(input: TaskEnqueueInput): Promise<TaskRecord> {
     return this.database.transaction((transaction) => enqueueTaskInTransaction(
@@ -1272,6 +1421,8 @@ export class Phase0Store {
       if (!workers[0]) throw new StoreError("unknown_worker", "Worker is not registered", 401);
       if (workers[0].revoked_at) throw new StoreError("revoked_worker", "Worker is revoked", 403);
 
+      await reconcileTerminalFailureRemediationsInTransaction(transaction, correlationId);
+
       const candidates = await transaction.query<Row>(
         `SELECT * FROM tasks
          WHERE attempt_count < max_attempts
@@ -1333,7 +1484,7 @@ export class Phase0Store {
         [candidate.id, workerId, leaseToken, leaseSeconds]
       );
       const task = taskFromRow(updatedTasks[0] ?? {});
-      const runtime = task.kind === "repo.update"
+      const runtime = isRepositoryMutationTaskKind(task.kind)
         || task.kind === "operator.query"
         || task.kind === "operator.request"
         || task.kind === "supervisor.request"
@@ -1538,10 +1689,10 @@ export class Phase0Store {
       );
       const activeRun = runRows[0];
       this.assertActiveLease(activeRun, workerId, command.leaseToken, ["running"]);
-      if (asString(activeRun.task_kind) !== "repo.update") {
+      if (!isRepositoryMutationTaskKind(asString(activeRun.task_kind))) {
         throw new StoreError(
           "git_publication_wrong_task",
-          "Git publication is only available for repo.update tasks",
+          "Git publication is only available for repository-mutation tasks",
           409
         );
       }
@@ -1918,7 +2069,10 @@ export class Phase0Store {
       const current = rows[0];
       this.assertActiveLease(current, workerId, completion.leaseToken, ["running"]);
 
-      if (completion.outcome === "succeeded" && asString(current.task_kind) === "repo.update") {
+      if (
+        completion.outcome === "succeeded"
+        && isRepositoryMutationTaskKind(asString(current.task_kind))
+      ) {
         const publicationRows = await transaction.query<Row>(
           "SELECT stage, commit_sha, remote_sha FROM git_publications WHERE task_id = $1 FOR UPDATE",
           [current.task_id]
@@ -1931,7 +2085,7 @@ export class Phase0Store {
         if (stage !== "no_changes" && !verified) {
           throw new StoreError(
             "git_publication_incomplete",
-            "A repo.update run can succeed only after Git publication is verified or records no changes",
+            "A repository-mutation run can succeed only after Git publication is verified or records no changes",
             409
           );
         }
@@ -1992,6 +2146,16 @@ export class Phase0Store {
         runId,
         payload: { errorSummary: completion.errorSummary }
       });
+
+      const remediation = taskStatus === "failed_terminal"
+        ? await enqueueTerminalFailureRemediation(
+            transaction,
+            task,
+            run.id,
+            run.errorSummary,
+            correlationId
+          )
+        : { task: null, created: false };
 
       if (task.kind === "notion.research" && taskStatus === "succeeded") {
         const sources = asObjectArray(run.output?.sources);
@@ -2061,7 +2225,9 @@ export class Phase0Store {
           await enqueueTelegramTextInTransaction(transaction, {
             dedupeKey: `${notificationBase}:failed`,
             chatId: telegramChatId,
-            text: `La richiesta “${task.objective}” è fallita dopo i tentativi previsti. Controlla la dashboard per i dettagli.`,
+            text: remediation.task
+              ? `La richiesta “${task.objective}” è fallita. Ho creato automaticamente la task di risoluzione ${remediation.task.id}; il worker la prenderà in carico senza richiedere un riavvio manuale.`
+              : `La richiesta “${task.objective}” è fallita dopo il limite di risoluzione automatica. Controlla la dashboard per i dettagli.`,
             taskId: task.id,
             runId: run.id,
             correlationId
@@ -2272,17 +2438,21 @@ export class Phase0Store {
               correlationId
             });
           }
-        } else if (task.kind === "repo.update") {
+        } else if (isRepositoryMutationTaskKind(task.kind)) {
           const publicationRows = await transaction.query<Row>(
             `SELECT stage, target_branch, commit_sha FROM git_publications
              WHERE task_id = $1 LIMIT 1`,
             [task.id]
           );
           const publication = publicationRows[0];
+          const isRemediation = task.kind === "failure.remediation"
+            || task.payload.automaticRemediation === true;
           const publicationText = asString(publication?.stage) === "no_changes"
-            ? `La modifica “${task.objective}” non ha prodotto cambiamenti da pubblicare.`
+            ? isRemediation
+              ? `La risoluzione automatica “${task.objective}” non ha individuato cambiamenti sicuri da pubblicare; l'evidenza resta disponibile in dashboard.`
+              : `La modifica “${task.objective}” non ha prodotto cambiamenti da pubblicare.`
             : [
-                `Modifica completata: ${task.objective}`,
+                `${isRemediation ? "Risoluzione automatica completata" : "Modifica completata"}: ${task.objective}`,
                 `Branch: ${asString(publication?.target_branch)}`,
                 `Commit: ${asString(publication?.commit_sha)}`
               ].join("\n");

@@ -613,6 +613,128 @@ describe("Phase 0 durable store", () => {
     expect(events.map((event) => event.type)).toContain("task.lease_renewed");
   });
 
+  it("creates one bounded durable remediation task for a terminal failure", async () => {
+    await registerWorker();
+    const source = await store.enqueueTask({
+      kind: "operator.query",
+      objective: "Complete an automatic action",
+      payload: { prompt: "Run the automatic action" },
+      dedupeKey: `terminal-source:${randomUUID()}`,
+      priority: 20,
+      maxAttempts: 1,
+      risk: "low"
+    });
+    const work = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!work) throw new Error("Expected source work");
+    await store.startRun(work.run.id, work.run.workerId, work.run.leaseToken);
+    await store.completeRun(work.run.id, work.run.workerId, {
+      leaseToken: work.run.leaseToken,
+      outcome: "failed_terminal",
+      runtimeThreadId: "failed-source-thread",
+      output: null,
+      errorSummary: "deterministic_source_failure"
+    });
+
+    const remediationRows = await database.query<{
+      id: string;
+      kind: string;
+      status: string;
+      priority: number;
+      max_attempts: number;
+      dedupe_key: string;
+      payload: Record<string, unknown>;
+    }>("SELECT * FROM tasks WHERE payload->>'automaticRemediation' = 'true'");
+    expect(remediationRows).toHaveLength(1);
+    expect(remediationRows[0]).toMatchObject({
+      kind: "repo.update",
+      status: "ready",
+      priority: 80,
+      max_attempts: 2,
+      dedupe_key: `failure-remediation:run:${work.run.id}`,
+      payload: {
+        sourceTaskId: source.id,
+        sourceRunId: work.run.id,
+        sourceTaskKind: "operator.query",
+        sourceErrorSummary: "deterministic_source_failure",
+        automaticRemediation: true,
+        remediationDepth: 1
+      }
+    });
+    expect(String(remediationRows[0]?.payload.prompt)).toContain("deterministic_source_failure");
+
+    const remediationWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!remediationWork) throw new Error("Expected remediation work");
+    expect(remediationWork.task.id).toBe(remediationRows[0]?.id);
+    expect(remediationWork.run.runtime).toBe("codex-sdk");
+    await store.startRun(
+      remediationWork.run.id,
+      remediationWork.run.workerId,
+      remediationWork.run.leaseToken
+    );
+    await store.completeRun(remediationWork.run.id, remediationWork.run.workerId, {
+      leaseToken: remediationWork.run.leaseToken,
+      outcome: "failed_terminal",
+      runtimeThreadId: "failed-remediation-thread",
+      output: null,
+      errorSummary: "bounded_remediation_failed"
+    });
+
+    const counts = await database.query<{ count: number }>(
+      "SELECT COUNT(*)::integer AS count FROM tasks WHERE payload->>'automaticRemediation' = 'true'"
+    );
+    expect(Number(counts[0]?.count)).toBe(1);
+    const remediationEvents = await database.query<{ type: string; payload: Record<string, unknown> }>(
+      "SELECT type, payload FROM events WHERE aggregate_type = 'remediation'"
+    );
+    expect(remediationEvents).toEqual([{
+      type: "remediation.requested",
+      payload: expect.objectContaining({
+        sourceTaskId: source.id,
+        sourceRunId: work.run.id,
+        depth: 1
+      })
+    }]);
+  });
+
+  it("backfills an earlier terminal failure before leasing new work", async () => {
+    await registerWorker();
+    const source = await store.enqueueTask({
+      kind: "operator.query",
+      objective: "Recover an earlier failure",
+      payload: { prompt: "Recover this" },
+      dedupeKey: `historical-terminal:${randomUUID()}`,
+      priority: 10,
+      maxAttempts: 1,
+      risk: "low"
+    });
+    const historicalRunId = randomUUID();
+    await database.query(
+      "UPDATE tasks SET status = 'failed_terminal' WHERE id = $1",
+      [source.id]
+    );
+    await database.query(
+      `INSERT INTO runs (
+         id, task_id, worker_id, attempt, runtime, status, lease_token,
+         error_summary, completed_at
+       ) VALUES ($1, $2, 'mac-mini-phase0', 1, 'codex-sdk', 'failed_terminal', $3,
+         'historical_failure', CURRENT_TIMESTAMP)`,
+      [historicalRunId, source.id, randomUUID()]
+    );
+
+    const work = await store.leaseNextTask("mac-mini-phase0", 300);
+    expect(work?.task).toMatchObject({
+      kind: "repo.update",
+      status: "leased",
+      payload: {
+        sourceTaskId: source.id,
+        sourceRunId: historicalRunId,
+        sourceErrorSummary: "historical_failure",
+        automaticRemediation: true,
+        remediationDepth: 1
+      }
+    });
+  });
+
   it("binds approve/reject to the immutable proposal hash", async () => {
     const { proposal } = await store.ensurePhase0Seed();
     const session = await store.createSession("c".repeat(64), 60);

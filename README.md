@@ -33,6 +33,8 @@ pnpm loop:enqueue-update
 
 The same prompt is deduplicated automatically. Set `LOOP_UPDATE_DEDUPE_KEY` when a caller needs an explicit stable idempotency key.
 
+Every terminal task failure creates one durable recovery `repo.update` task, visibly marked by `automaticRemediation`, with the source task/run, normalized error, original authorized objective, and a stable per-run dedupe key. Using the established task kind keeps recovery compatible across rolling control-plane/worker upgrades. The recovery task is processed through the same isolated worktree, validation, secret scanning, audit, and non-force publication path as a normal repository update. Remediation depth is capped at one, so a failed recovery cannot recursively create an unbounded loop. Both leasing and the host worker reconcile terminal failures that predate the mechanism; the worker-side PostgreSQL pass keeps this behavior active during a rolling web deployment.
+
 The validation boundary uses macOS Seatbelt at `/usr/bin/sandbox-exec`. Run the worker from a normal terminal or host service; launching it inside another Seatbelt sandbox makes validation fail closed because macOS does not permit nested sandbox application.
 
 ## Verification
@@ -54,7 +56,7 @@ The detailed acceptance matrix and current evidence live in [`docs/phase0/PLAN.m
 
 Deploy `apps/web` to Vercel with the same server-side secrets and a production PostgreSQL URL. Never expose `WORKER_SECRET`, `SESSION_SECRET`, `DASHBOARD_ACCESS_CODE`, or `NOTION_TOKEN` through `NEXT_PUBLIC_*` variables. After deployment, set `WORKER_BASE_URL` on the Mac to the HTTPS deployment URL and verify that its heartbeat is visible.
 
-The launchd template is installed explicitly with `scripts/install-launchd.sh`; it is not installed automatically by repository setup. The installer captures the current Node/pnpm runtime path so the service does not depend on an interactive shell profile.
+Install and load the always-on host service with `scripts/install-launchd.sh`. The command is idempotent: it synchronizes a dedicated non-authoritative runtime checkout under `~/Library/Application Support/MeaWorld Company OS/repository`, installs dependencies from the local pnpm store, copies `.env.local` with mode `0600`, installs the launchd definition, replaces an already loaded instance, and starts it. The separate checkout avoids macOS background-process privacy blocking on repositories under `~/Desktop`; the human workspace remains untouched. Use `--install-only` only when intentionally preparing the service without enabling it. launchd keeps a small supervisor alive; the supervisor owns the worker child, restarts it with bounded backoff after crashes, and replaces it automatically when worker/package code, runtime `.env.local`, or configuration changes. A supervisor-code change exits the parent so launchd reloads the new version. No terminal window or manual worker restart is required.
 
 ## Telegram operator channel
 

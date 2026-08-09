@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { CodexSdkRuntime, type AgentRuntime } from "@meaworld/codex";
+import { connectPostgres, Phase0Store } from "@meaworld/db";
+import { isRepositoryMutationTaskKind } from "@meaworld/domain";
 import { NotionResearchError, researchNotion } from "@meaworld/notion";
 import { log } from "@meaworld/observability";
 import { executeTask } from "@meaworld/orchestration";
@@ -17,6 +19,7 @@ export class Phase0Worker {
   private sequence = 0;
   private activeRunId: string | null = null;
   private stopping = false;
+  private lastFailureReconciliationAt = 0;
 
   constructor(
     private readonly config: WorkerConfig,
@@ -110,7 +113,7 @@ export class Phase0Worker {
 
       let result: Awaited<ReturnType<typeof executeTask>>;
       try {
-        result = work.task.kind === "repo.update"
+        result = isRepositoryMutationTaskKind(work.task.kind)
           ? await this.gitUpdates.execute({
               task: work.task,
               runId: work.run.id,
@@ -162,6 +165,31 @@ export class Phase0Worker {
           message: error instanceof Error ? error.message : "Unknown worker heartbeat error"
         });
       });
+    }
+  }
+
+  async reconcileTerminalFailures(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastFailureReconciliationAt < 30_000) return;
+    this.lastFailureReconciliationAt = now;
+    const connection = connectPostgres(this.config.databaseUrl, { max: 1 });
+    try {
+      const remediations = await new Phase0Store(
+        connection.database
+      ).reconcileTerminalFailureRemediations();
+      if (remediations.length > 0) {
+        log({
+          level: "warn",
+          event: "worker.failure_remediations_created",
+          message: "Worker created durable remediation tasks for terminal failures",
+          data: {
+            count: remediations.length,
+            taskIds: remediations.map((task) => task.id)
+          }
+        });
+      }
+    } finally {
+      await connection.close();
     }
   }
 
@@ -302,6 +330,7 @@ export class Phase0Worker {
 
   async runOnce(): Promise<void> {
     await this.heartbeat();
+    await this.reconcileTerminalFailures(true);
     await this.processOneTelegramNotification();
     await this.processOneTask();
     await this.processOneTelegramNotification();
@@ -331,6 +360,13 @@ export class Phase0Worker {
 
   async runDaemon(): Promise<void> {
     await this.heartbeat();
+    await this.reconcileTerminalFailures(true).catch((error: unknown) => {
+      log({
+        level: "error",
+        event: "worker.failure_reconciliation_failed",
+        message: error instanceof Error ? error.message : "Unknown failure reconciliation error"
+      });
+    });
     const heartbeatTimer = setInterval(() => {
       void this.heartbeat().catch((error: unknown) => {
         log({
@@ -344,6 +380,13 @@ export class Phase0Worker {
     try {
       while (!this.stopping) {
         try {
+          await this.reconcileTerminalFailures().catch((error: unknown) => {
+            log({
+              level: "error",
+              event: "worker.failure_reconciliation_failed",
+              message: error instanceof Error ? error.message : "Unknown failure reconciliation error"
+            });
+          });
           const notified = await this.processOneTelegramNotification();
           const processed = await this.processOneTask();
           if (!processed && !notified) await sleep(Math.min(this.config.heartbeatIntervalMs, 10_000));
