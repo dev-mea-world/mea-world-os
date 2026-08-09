@@ -316,10 +316,30 @@ function containsLikelySecret(content: string): boolean {
     /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
     /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
     /\bsecret_[A-Za-z0-9]{20,}\b/,
-    /\bAKIA[0-9A-Z]{16}\b/,
-    /(?:^|[\s"'`])(?:NOTION_TOKEN|WORKER_SECRET|SESSION_SECRET|DASHBOARD_ACCESS_CODE|OPENAI_API_KEY|GITHUB_TOKEN|API_KEY|PASSWORD)\s*[:=]\s*["']?[^\s"']{8,}/im
+    /\bAKIA[0-9A-Z]{16}\b/
   ];
-  return patterns.some((pattern) => pattern.test(content));
+  if (patterns.some((pattern) => pattern.test(content))) return true;
+
+  const assignments = /(?:^|[\s"'`])(?:NOTION_TOKEN|WORKER_SECRET|SESSION_SECRET|DASHBOARD_ACCESS_CODE|OPENAI_API_KEY|GITHUB_TOKEN|API_KEY|PASSWORD)[ \t]*([:=])[ \t]*([^\r\n]*)/gim;
+  for (const match of content.matchAll(assignments)) {
+    const separator = match[1];
+    const rawValue = match[2]?.trim() ?? "";
+    if (!rawValue) continue;
+    const quote = rawValue[0];
+    if (quote === '"' || quote === "'") {
+      const closingQuote = rawValue.indexOf(quote, 1);
+      const value = closingQuote < 0 ? rawValue.slice(1) : rawValue.slice(1, closingQuote);
+      if (value.length >= 8) return true;
+      continue;
+    }
+
+    // A validation-only Zod chain declares a field shape; defaults are intentionally not exempt.
+    const zodSchemaDeclaration = separator === ":"
+      && /^z\.string\(\)(?:\.(?:endsWith|includes|length|max|min|nonempty|nullable|optional|regex|startsWith|toLowerCase|toUpperCase|trim|url|uuid)\([^;\r\n]*\))*[,]?$/.test(rawValue);
+    const value = rawValue.split(/[\s,;#}]/, 1)[0] ?? "";
+    if (!zodSchemaDeclaration && value.length >= 8) return true;
+  }
+  return false;
 }
 
 function envExampleHasValues(content: string): boolean {

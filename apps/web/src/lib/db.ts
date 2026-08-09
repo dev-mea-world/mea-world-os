@@ -11,5 +11,7 @@ export function getConnection(): PostgresConnection {
 }
 
 export function getStore(): Phase0Store {
-  return new Phase0Store(getConnection().database);
+  return new Phase0Store(getConnection().database, {
+    telegramNotionResponseThreshold: getWebEnv().TELEGRAM_NOTION_RESPONSE_THRESHOLD
+  });
 }

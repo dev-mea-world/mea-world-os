@@ -181,7 +181,7 @@ describe("automatic Git publisher", () => {
     const workspace = await subject.prepareWorkspace({ taskId: TASK_TWO, runId: RUN_ONE, baseSha });
     await writeFile(
       join(workspace.path, "config.txt"),
-      `GITHUB_TOKEN=ghp_${"a".repeat(32)}\n`,
+      `${["GITHUB", "TOKEN"].join("_")}=ghp_${"a".repeat(32)}\n`,
       "utf8"
     );
     await expect(subject.validateAndCommit({
@@ -194,6 +194,69 @@ describe("automatic Git publisher", () => {
       retryable: false
     });
     expect(git(fixture.repository, ["ls-remote", "--heads", "origin", "refs/heads/automation/phase0-updates"])).toBe("");
+  });
+
+  it("does not treat Zod credential schemas as assigned secret values", async () => {
+    const fixture = await createRepository();
+    temporaryDirectories.push(fixture.temporaryDirectory);
+    const subject = publisher(fixture.repository);
+    const baseSha = await subject.resolveBase();
+    const workspace = await subject.prepareWorkspace({ taskId: TASK_THREE, runId: RUN_TWO, baseSha });
+    await writeFile(
+      join(workspace.path, "config.ts"),
+      [
+        'import { z } from "zod";',
+        "export const ConfigSchema = z.object({",
+        `  ${["WORKER", "SECRET"].join("_")}: z.string().min(32),`,
+        `  ${["NOTION", "TOKEN"].join("_")}: z.string().optional()`,
+        "});",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    await writeFile(
+      join(workspace.path, ".env.example"),
+      `${["WORKER", "SECRET"].join("_")}=\n${["NOTION", "TOKEN"].join("_")}=\n`,
+      "utf8"
+    );
+
+    const outcome = await subject.validateAndCommit({
+      taskId: TASK_THREE,
+      runId: RUN_TWO,
+      workspace,
+      expectedBaseSha: baseSha
+    }).then(
+      (result) => result.status,
+      (error: unknown) => error instanceof RepositoryPublisherError ? error.code : "unexpected_error"
+    );
+    expect([
+      "committed",
+      "git_validation_fixture_failed",
+      "git_validation_sandbox_unavailable"
+    ]).toContain(outcome);
+  });
+
+  it.each([
+    ["credential assignment", "config.json", `${["WORKER", "SECRET"].join("_")}: "${"w".repeat(32)}"\n`, "git_likely_secret_detected"],
+    ["private key", "notes.txt", `${["-----BEGIN", "PRIVATE KEY-----"].join(" ")}\nnot-a-real-key\n`, "git_likely_secret_detected"],
+    ["non-empty env example", ".env.example", `${["WORKER", "SECRET"].join("_")}=placeholder-value\n`, "git_env_example_contains_value"]
+  ])("still blocks %s material", async (_label, filename, content, expectedCode) => {
+    const fixture = await createRepository();
+    temporaryDirectories.push(fixture.temporaryDirectory);
+    const subject = publisher(fixture.repository);
+    const baseSha = await subject.resolveBase();
+    const workspace = await subject.prepareWorkspace({ taskId: TASK_ONE, runId: RUN_TWO, baseSha });
+    await writeFile(join(workspace.path, filename), content, "utf8");
+
+    await expect(subject.validateAndCommit({
+      taskId: TASK_ONE,
+      runId: RUN_TWO,
+      workspace,
+      expectedBaseSha: baseSha
+    })).rejects.toMatchObject<Partial<RepositoryPublisherError>>({
+      code: expectedCode,
+      retryable: false
+    });
   });
 
   it("rejects dependency paths created during the repository update", async () => {

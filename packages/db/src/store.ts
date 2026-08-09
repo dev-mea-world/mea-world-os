@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { computeProposalHash, type ProposalHashInput } from "@meaworld/approvals";
 import type {
   DashboardSnapshot,
@@ -191,6 +191,27 @@ function errorCode(error: unknown): string | undefined {
     return String((error as { code: unknown }).code);
   }
   return undefined;
+}
+
+function safeErrorCode(value: unknown, fallback: string): string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9._-]{0,127}$/.test(value)
+    ? value
+    : fallback;
+}
+
+function safeNotionPageUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2_000) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && (
+      url.hostname === "notion.so"
+      || url.hostname.endsWith(".notion.so")
+      || url.hostname === "notion.site"
+      || url.hostname.endsWith(".notion.site")
+    );
+  } catch {
+    return false;
+  }
 }
 
 export class StoreError extends Error {
@@ -441,6 +462,116 @@ async function enqueueTelegramTextInTransaction(
   }
 }
 
+function conciseTelegramSummary(response: string, maximumLength = 480): string {
+  const normalized = response.replace(/\s+/g, " ").trim();
+  const sentence = normalized.match(/^.*?[.!?](?:\s|$)/)?.[0]?.trim() ?? normalized;
+  if (sentence.length <= maximumLength) return sentence;
+  return `${sentence.slice(0, maximumLength - 1).trimEnd()}…`;
+}
+
+async function enqueueTelegramResponseInTransaction(
+  database: Database,
+  input: {
+    threshold: number;
+    chatId: number;
+    telegramUserId: string | null;
+    response: string;
+    objective: string;
+    taskId: string;
+    runId: string;
+    dedupeKey: string;
+    correlationId: string;
+  }
+): Promise<void> {
+  const response = input.response.trim() || "Operazione completata senza un messaggio di risposta.";
+  if (response.length <= input.threshold) {
+    await enqueueTelegramTextInTransaction(database, {
+      dedupeKey: input.dedupeKey,
+      chatId: input.chatId,
+      text: response,
+      taskId: input.taskId,
+      runId: input.runId,
+      correlationId: input.correlationId
+    });
+    return;
+  }
+
+  const requestedAt = new Date().toISOString();
+  const idempotencyKey = `telegram:notion-response:${input.runId}`;
+  const contentHash = createHash("sha256").update(response, "utf8").digest("hex");
+  const summary = conciseTelegramSummary(response);
+  const publicationTask = await enqueueTaskInTransaction(
+    database,
+    {
+      kind: "notion.telegram-response.publish",
+      objective: `Publish the long Telegram response for “${input.objective}” as a new governed Notion page`,
+      payload: {
+        response,
+        summary,
+        contentHash,
+        idempotencyKey,
+        requestedAt,
+        source: "telegram",
+        sourceTaskId: input.taskId,
+        sourceRunId: input.runId,
+        sourceObjective: input.objective,
+        telegramChatId: String(input.chatId),
+        ...(input.telegramUserId ? { telegramUserId: input.telegramUserId } : {})
+      },
+      dedupeKey: idempotencyKey,
+      priority: 44,
+      maxAttempts: 3,
+      risk: "low"
+    },
+    {
+      type: "system",
+      id: "telegram-response-router",
+      correlationId: input.correlationId
+    }
+  );
+  const publicationId = randomUUID();
+  const rows = await database.query<Row>(
+    `INSERT INTO notion_response_publications (
+       id, idempotency_key, source_task_id, source_run_id, publication_task_id,
+       status, response_content_hash, response_character_count, requested_at, summary
+     ) VALUES ($1, $2, $3, $4, $5, 'planned', $6, $7, $8, $9)
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING id`,
+    [
+      publicationId,
+      idempotencyKey,
+      input.taskId,
+      input.runId,
+      publicationTask.id,
+      contentHash,
+      response.length,
+      requestedAt,
+      summary
+    ]
+  );
+  if (!rows[0]) return;
+  await appendEvent(database, {
+    type: "notion.response_publication.planned",
+    actorType: "system",
+    actorId: "telegram-response-router",
+    aggregateType: "notion_response_publication",
+    aggregateId: publicationId,
+    aggregateVersion: 1,
+    correlationId: input.correlationId,
+    taskId: publicationTask.id,
+    runId: input.runId,
+    payload: {
+      idempotencyKey,
+      sourceTaskId: input.taskId,
+      sourceRunId: input.runId,
+      contentHash,
+      createdAt: requestedAt,
+      responseCharacterCount: response.length,
+      validationState: "ai_generated_unvalidated"
+    }
+  });
+}
+
 async function telegramConversationContext(
   database: Database,
   chatId: number,
@@ -558,8 +689,23 @@ function explicitTaskStatusTarget(
   return candidate && typeof candidate.taskId === "string" ? candidate.taskId : null;
 }
 
+export interface Phase0StoreOptions {
+  telegramNotionResponseThreshold?: number;
+}
+
 export class Phase0Store {
-  constructor(private readonly database: Database) {}
+  private readonly telegramNotionResponseThreshold: number;
+
+  constructor(
+    private readonly database: Database,
+    options: Phase0StoreOptions = {}
+  ) {
+    const threshold = options.telegramNotionResponseThreshold ?? 3_500;
+    if (!Number.isInteger(threshold) || threshold < 500 || threshold > 10_000) {
+      throw new RangeError("telegramNotionResponseThreshold must be an integer between 500 and 10000");
+    }
+    this.telegramNotionResponseThreshold = threshold;
+  }
 
   async enqueueTask(input: TaskEnqueueInput): Promise<TaskRecord> {
     return this.database.transaction((transaction) => enqueueTaskInTransaction(
@@ -1316,6 +1462,36 @@ export class Phase0Store {
               runId: asString(interruptedRun.id),
               payload: { reason: "lease_expired" }
             });
+            if (asString(candidate.kind) === "notion.telegram-response.publish") {
+              const publications = await transaction.query<Row>(
+                `UPDATE notion_response_publications SET
+                   status = 'planned', current_run_id = NULL,
+                   last_error_code = 'notion_publication_outcome_unknown',
+                   aggregate_version = aggregate_version + 1,
+                   updated_at = CURRENT_TIMESTAMP
+                 WHERE publication_task_id = $1 AND status = 'creating'
+                 RETURNING *`,
+                [candidate.id]
+              );
+              const publication = publications[0];
+              if (publication) {
+                await appendEvent(transaction, {
+                  type: "notion.response_publication.outcome_unknown",
+                  actorType: "system",
+                  actorId: "lease-reconciler",
+                  aggregateType: "notion_response_publication",
+                  aggregateId: asString(publication.id),
+                  aggregateVersion: asNumber(publication.aggregate_version),
+                  correlationId,
+                  taskId: asString(candidate.id),
+                  runId: asString(interruptedRun.id),
+                  payload: {
+                    errorCode: "notion_publication_outcome_unknown",
+                    recoveryStrategy: "search_exact_idempotency_marker_before_create"
+                  }
+                });
+              }
+            }
           }
         }
       }
@@ -1333,7 +1509,9 @@ export class Phase0Store {
         [candidate.id, workerId, leaseToken, leaseSeconds]
       );
       const task = taskFromRow(updatedTasks[0] ?? {});
-      const runtime = task.kind === "repo.update"
+      const runtime = task.kind === "notion.telegram-response.publish"
+        ? "notion-api"
+        : task.kind === "repo.update"
         || task.kind === "operator.query"
         || task.kind === "operator.request"
         || task.kind === "supervisor.request"
@@ -1383,7 +1561,8 @@ export class Phase0Store {
     return this.database.transaction(async (transaction) => {
       const rows = await transaction.query<Row>(
         `SELECT r.*, t.status AS task_status, t.lease_token AS task_lease_token,
-           t.lease_expires_at AS task_lease_expires_at, t.aggregate_version AS task_version
+           t.lease_expires_at AS task_lease_expires_at, t.aggregate_version AS task_version,
+           t.kind AS task_kind
          FROM runs r JOIN tasks t ON t.id = r.task_id
          WHERE r.id = $1 FOR UPDATE OF r, t`,
         [runId]
@@ -1425,6 +1604,40 @@ export class Phase0Store {
         taskId: task.id,
         runId
       });
+      if (asString(current.task_kind) === "notion.telegram-response.publish") {
+        const publications = await transaction.query<Row>(
+          `UPDATE notion_response_publications SET
+             status = 'creating', current_run_id = $2, last_error_code = NULL,
+             aggregate_version = aggregate_version + 1,
+             updated_at = CURRENT_TIMESTAMP
+           WHERE publication_task_id = $1 AND status IN ('planned', 'creating')
+           RETURNING *`,
+          [task.id, runId]
+        );
+        const publication = publications[0];
+        if (!publication) {
+          throw new StoreError(
+            "notion_response_publication_missing",
+            "The Notion response publication plan is missing",
+            409
+          );
+        }
+        await appendEvent(transaction, {
+          type: "notion.response_publication.started",
+          actorType: "worker",
+          actorId: workerId,
+          aggregateType: "notion_response_publication",
+          aggregateId: asString(publication.id),
+          aggregateVersion: asNumber(publication.aggregate_version),
+          correlationId,
+          taskId: task.id,
+          runId,
+          payload: {
+            attempt: run.attempt,
+            idempotencyKey: asString(publication.idempotency_key)
+          }
+        });
+      }
       return run;
     });
   }
@@ -1993,6 +2206,134 @@ export class Phase0Store {
         payload: { errorSummary: completion.errorSummary }
       });
 
+      const taskPayload = asObject(current.task_payload);
+      if (task.kind === "notion.telegram-response.publish") {
+        const publicationRows = await transaction.query<Row>(
+          `SELECT * FROM notion_response_publications
+           WHERE publication_task_id = $1 FOR UPDATE`,
+          [task.id]
+        );
+        const publication = publicationRows[0];
+        if (!publication) {
+          throw new StoreError(
+            "notion_response_publication_missing",
+            "The Notion response publication plan is missing",
+            409
+          );
+        }
+        const publicationOutput = asObject(run.output?.notionPublication);
+        const outputValid = taskStatus === "succeeded"
+          && publicationOutput.status === "created"
+          && typeof publicationOutput.pageId === "string"
+          && /^[a-f0-9]{32}$/i.test(publicationOutput.pageId.replaceAll("-", ""))
+          && safeNotionPageUrl(publicationOutput.pageUrl)
+          && typeof publicationOutput.title === "string"
+          && publicationOutput.title === `[AI UNVALIDATED] Telegram response · ${asString(taskPayload.sourceRunId)}`
+          && publicationOutput.idempotencyKey === asString(publication.idempotency_key)
+          && publicationOutput.contentHash === asString(publication.response_content_hash)
+          && publicationOutput.createdAt === taskPayload.requestedAt
+          && publicationOutput.validationState === "ai_generated_unvalidated";
+
+        if (outputValid) {
+          const updated = await transaction.query<Row>(
+            `UPDATE notion_response_publications SET
+               status = 'created', title = $2, page_id = $3, page_url = $4,
+               last_error_code = NULL, current_run_id = $5,
+               aggregate_version = aggregate_version + 1,
+               updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
+             WHERE id = $1 RETURNING *`,
+            [
+              publication.id,
+              publicationOutput.title,
+              publicationOutput.pageId,
+              publicationOutput.pageUrl,
+              run.id
+            ]
+          );
+          const created = updated[0] ?? {};
+          await appendEvent(transaction, {
+            type: "notion.response_publication.created",
+            actorType: "worker",
+            actorId: workerId,
+            aggregateType: "notion_response_publication",
+            aggregateId: asString(created.id),
+            aggregateVersion: asNumber(created.aggregate_version),
+            correlationId,
+            taskId: task.id,
+            runId: run.id,
+            payload: {
+              pageId: publicationOutput.pageId,
+              pageUrl: publicationOutput.pageUrl,
+              idempotencyKey: publicationOutput.idempotencyKey,
+              contentHash: publicationOutput.contentHash,
+              createdAt: publicationOutput.createdAt,
+              validationState: "ai_generated_unvalidated",
+              recovered: publicationOutput.recovered === true
+            }
+          });
+          const chatId = Number(taskPayload.telegramChatId);
+          if (Number.isSafeInteger(chatId)) {
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `telegram:notion-response:${asString(created.id)}:summary`,
+              chatId,
+              text: [
+                "Risposta lunga — sintesi AI non validata:",
+                asString(created.summary),
+                "",
+                `Risposta completa: ${publicationOutput.pageUrl}`
+              ].join("\n"),
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          }
+        } else {
+          const retryScheduled = taskStatus === "ready";
+          const failureCode = taskStatus === "succeeded"
+            ? "notion_publication_result_invalid"
+            : safeErrorCode(publicationOutput.errorCode, "notion_page_creation_failed");
+          const updated = await transaction.query<Row>(
+            `UPDATE notion_response_publications SET
+               status = $2, last_error_code = $3, current_run_id = $4,
+               aggregate_version = aggregate_version + 1,
+               updated_at = CURRENT_TIMESTAMP,
+               completed_at = CASE WHEN $2 = 'failed' THEN CURRENT_TIMESTAMP ELSE NULL END
+             WHERE id = $1 RETURNING *`,
+            [publication.id, retryScheduled ? "planned" : "failed", failureCode, retryScheduled ? null : run.id]
+          );
+          const failed = updated[0] ?? {};
+          await appendEvent(transaction, {
+            type: retryScheduled
+              ? "notion.response_publication.retry_scheduled"
+              : "notion.response_publication.failed",
+            actorType: "worker",
+            actorId: workerId,
+            aggregateType: "notion_response_publication",
+            aggregateId: asString(failed.id),
+            aggregateVersion: asNumber(failed.aggregate_version),
+            correlationId,
+            taskId: task.id,
+            runId: run.id,
+            payload: { errorCode: failureCode, retryScheduled }
+          });
+          if (!retryScheduled) {
+            const chatId = Number(taskPayload.telegramChatId);
+            if (Number.isSafeInteger(chatId)) {
+              await enqueueTelegramTextInTransaction(transaction, {
+                dedupeKey: `telegram:notion-response:${asString(failed.id)}:fallback`,
+                chatId,
+                text: typeof taskPayload.response === "string"
+                  ? taskPayload.response
+                  : "La risposta è stata completata, ma la pubblicazione Notion non è riuscita e il testo non è disponibile.",
+                taskId: task.id,
+                runId: run.id,
+                correlationId
+              });
+            }
+          }
+        }
+      }
+
       if (task.kind === "notion.research" && taskStatus === "succeeded") {
         const sources = asObjectArray(run.output?.sources);
         let recordedSources = 0;
@@ -2051,13 +2392,14 @@ export class Phase0Store {
         });
       }
 
-      const taskPayload = asObject(current.task_payload);
       const telegramChatId = taskPayload.source === "telegram"
         ? Number(taskPayload.telegramChatId)
         : Number.NaN;
       if (Number.isSafeInteger(telegramChatId) && taskStatus !== "ready") {
         const notificationBase = `telegram:task:${task.id}:run:${run.id}`;
-        if (taskStatus === "failed_terminal") {
+        if (task.kind === "notion.telegram-response.publish") {
+          // Publication completion already queued either the summary/link or the text fallback above.
+        } else if (taskStatus === "failed_terminal") {
           await enqueueTelegramTextInTransaction(transaction, {
             dedupeKey: `${notificationBase}:failed`,
             chatId: telegramChatId,
@@ -2068,14 +2410,19 @@ export class Phase0Store {
           });
         } else if (task.kind === "operator.query" || task.kind === "notion.research") {
           const response = run.output?.response;
-          await enqueueTelegramTextInTransaction(transaction, {
-            dedupeKey: `${notificationBase}:answer`,
+          await enqueueTelegramResponseInTransaction(transaction, {
+            threshold: this.telegramNotionResponseThreshold,
             chatId: telegramChatId,
-            text: typeof response === "string"
+            telegramUserId: typeof taskPayload.telegramUserId === "string"
+              ? taskPayload.telegramUserId
+              : null,
+            response: typeof response === "string"
               ? response
               : "La risposta è stata completata, ma non contiene testo visualizzabile.",
+            objective: task.objective,
             taskId: task.id,
             runId: run.id,
+            dedupeKey: `${notificationBase}:answer`,
             correlationId
           });
         } else if (
@@ -2085,12 +2432,17 @@ export class Phase0Store {
         ) {
           const intent = run.output?.intent;
           if (intent === "answer" && typeof run.output?.response === "string") {
-            await enqueueTelegramTextInTransaction(transaction, {
-              dedupeKey: `${notificationBase}:answer`,
+            await enqueueTelegramResponseInTransaction(transaction, {
+              threshold: this.telegramNotionResponseThreshold,
               chatId: telegramChatId,
-              text: run.output.response,
+              telegramUserId: typeof taskPayload.telegramUserId === "string"
+                ? taskPayload.telegramUserId
+                : null,
+              response: run.output.response,
+              objective: task.objective,
               taskId: task.id,
               runId: run.id,
+              dedupeKey: `${notificationBase}:answer`,
               correlationId
             });
           } else if (
@@ -2132,12 +2484,17 @@ export class Phase0Store {
               correlationId
             });
           } else if (intent === "task_status" && typeof run.output?.taskId === "string") {
-            await enqueueTelegramTextInTransaction(transaction, {
-              dedupeKey: `${notificationBase}:task-status`,
+            await enqueueTelegramResponseInTransaction(transaction, {
+              threshold: this.telegramNotionResponseThreshold,
               chatId: telegramChatId,
-              text: await telegramTaskStatusText(transaction, telegramChatId, run.output.taskId),
+              telegramUserId: typeof taskPayload.telegramUserId === "string"
+                ? taskPayload.telegramUserId
+                : null,
+              response: await telegramTaskStatusText(transaction, telegramChatId, run.output.taskId),
+              objective: task.objective,
               taskId: task.id,
               runId: run.id,
+              dedupeKey: `${notificationBase}:task-status`,
               correlationId
             });
           } else if (

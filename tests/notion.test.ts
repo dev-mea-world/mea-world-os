@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   NotionResearchError,
+  NotionResponsePublicationError,
+  publishTelegramResponseToNotion,
   researchNotion,
   sampleNotionInventory
 } from "@meaworld/notion";
@@ -136,5 +139,100 @@ describe("bounded read-only Notion research", () => {
       code: "notion_page_fetch_failed",
       retryable: true
     }));
+  });
+});
+
+describe("governed Telegram response publication", () => {
+  const response = "Risposta completa. ".repeat(300);
+  const input = {
+    parentPageId: "11111111-1111-4111-8111-111111111111",
+    sourceTaskId: "22222222-2222-4222-8222-222222222222",
+    sourceRunId: "33333333-3333-4333-8333-333333333333",
+    idempotencyKey: "telegram:notion-response:33333333-3333-4333-8333-333333333333",
+    createdAt: "2026-08-09T12:00:00.000Z",
+    response,
+    contentHash: createHash("sha256").update(response.trim(), "utf8").digest("hex")
+  };
+
+  it("creates only a new, visibly unvalidated page with provenance and bounded blocks", async () => {
+    const search = vi.fn().mockResolvedValue({ results: [] });
+    const createPage = vi.fn().mockResolvedValue({
+      id: "44444444-4444-4444-8444-444444444444",
+      object: "page",
+      url: "https://notion.so/44444444444444448444444444444444"
+    });
+
+    const published = await publishTelegramResponseToNotion(
+      "test-token",
+      input,
+      { search, createPage }
+    );
+
+    expect(published).toEqual({
+      pageId: "44444444-4444-4444-8444-444444444444",
+      pageUrl: "https://notion.so/44444444444444448444444444444444",
+      title: `[AI UNVALIDATED] Telegram response · ${input.sourceRunId}`,
+      recovered: false
+    });
+    expect(search).toHaveBeenCalledWith({
+      query: input.sourceRunId,
+      page_size: 20,
+      filter: { property: "object", value: "page" }
+    });
+    expect(createPage).toHaveBeenCalledOnce();
+    const pageInput = createPage.mock.calls[0]?.[0] as {
+      parent: Record<string, unknown>;
+      properties: Record<string, unknown>;
+      children: Array<Record<string, unknown>>;
+    };
+    expect(pageInput.parent).toEqual({ type: "page_id", page_id: input.parentPageId });
+    expect(JSON.stringify(pageInput.properties)).toContain("AI UNVALIDATED");
+    const serializedChildren = JSON.stringify(pageInput.children);
+    expect(serializedChildren).toContain("AI-GENERATED · UNVALIDATED");
+    expect(serializedChildren).toContain(`Source task ID: ${input.sourceTaskId}`);
+    expect(serializedChildren).toContain(`Source run ID: ${input.sourceRunId}`);
+    expect(serializedChildren).toContain(`Created at: ${input.createdAt}`);
+    expect(serializedChildren).toContain(`Idempotency key: ${input.idempotencyKey}`);
+    expect(serializedChildren).toContain(`Content SHA-256: ${input.contentHash}`);
+    expect(serializedChildren).toContain(input.response.slice(0, 500));
+    expect(pageInput.children.length).toBeLessThanOrEqual(100);
+  });
+
+  it("recovers an existing page by exact title, parent, and idempotent run marker", async () => {
+    const title = `[AI UNVALIDATED] Telegram response · ${input.sourceRunId}`;
+    const createPage = vi.fn();
+    const published = await publishTelegramResponseToNotion("test-token", input, {
+      search: vi.fn().mockResolvedValue({
+        results: [{
+          id: "55555555-5555-4555-8555-555555555555",
+          object: "page",
+          url: "https://notion.so/55555555555545558555555555555555",
+          parent: { type: "page_id", page_id: input.parentPageId.replaceAll("-", "") },
+          properties: {
+            Name: { type: "title", title: [{ plain_text: title }] }
+          }
+        }]
+      }),
+      createPage
+    });
+
+    expect(published).toMatchObject({
+      pageId: "55555555-5555-4555-8555-555555555555",
+      pageUrl: "https://notion.so/55555555555545558555555555555555",
+      recovered: true
+    });
+    expect(createPage).not.toHaveBeenCalled();
+  });
+
+  it("fails closed without creating when the idempotency lookup is unavailable", async () => {
+    const createPage = vi.fn();
+    await expect(publishTelegramResponseToNotion("test-token", input, {
+      search: vi.fn().mockRejectedValue({ status: 503 }),
+      createPage
+    })).rejects.toMatchObject<Partial<NotionResponsePublicationError>>({
+      code: "notion_page_creation_failed",
+      retryable: true
+    });
+    expect(createPage).not.toHaveBeenCalled();
   });
 });

@@ -31,6 +31,10 @@ const WorkerConfigSchema = z.object({
   NOTION_SAMPLE_LIMIT: integerFromEnvironment(5, 1, 20),
   NOTION_RESEARCH_MAX_PAGES: integerFromEnvironment(15, 1, 30),
   NOTION_RESEARCH_MAX_CHARACTERS: integerFromEnvironment(60_000, 5_000, 120_000),
+  NOTION_TELEGRAM_PARENT_PAGE_ID: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().regex(/^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i).optional()
+  ),
   TELEGRAM_BOT_TOKEN: z.preprocess(
     (value) => value === "" ? undefined : value,
     z.string().min(30).max(256).optional()
@@ -56,6 +60,7 @@ export interface WorkerConfig {
   notionSampleLimit: number;
   notionResearchMaxPages: number;
   notionResearchMaxCharacters: number;
+  notionTelegramParentPageId: string | undefined;
   telegramBotToken: string | undefined;
   codexWorkingDirectory: string;
   gitAutoPublishEnabled: boolean;
@@ -80,6 +85,7 @@ export function getWorkerConfig(): WorkerConfig {
     notionSampleLimit: parsed.NOTION_SAMPLE_LIMIT,
     notionResearchMaxPages: parsed.NOTION_RESEARCH_MAX_PAGES,
     notionResearchMaxCharacters: parsed.NOTION_RESEARCH_MAX_CHARACTERS,
+    notionTelegramParentPageId: parsed.NOTION_TELEGRAM_PARENT_PAGE_ID,
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     codexWorkingDirectory: parsed.CODEX_WORKING_DIRECTORY,
     gitAutoPublishEnabled: parsed.GIT_AUTO_PUBLISH_ENABLED,

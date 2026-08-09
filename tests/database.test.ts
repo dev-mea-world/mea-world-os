@@ -77,7 +77,8 @@ describe("Phase 0 durable store", () => {
       "0001_phase0.sql",
       "0002_git_publications.sql",
       "0003_telegram_operator.sql",
-      "0004_telegram_requests_outbox.sql"
+      "0004_telegram_requests_outbox.sql",
+      "0005_notion_response_publications.sql"
     ]);
 
     const constraints = await database.query<{ count: number }>(
@@ -385,6 +386,216 @@ describe("Phase 0 durable store", () => {
       replyMarkup: null
     });
     expect(queued.task?.id).toBe(work.task.id);
+  });
+
+  it("publishes long Telegram answers through an audited, idempotent Notion child task", async () => {
+    store = new Phase0Store(database, { telegramNotionResponseThreshold: 500 });
+    await store.processTelegramCommand({
+      updateId: 211,
+      chatId: 711,
+      userId: 811,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    await store.processTelegramCommand({
+      updateId: 212,
+      chatId: 711,
+      userId: 811,
+      username: "operator",
+      messageId: 2,
+      action: "ask",
+      pairCodeValid: false,
+      prompt: "Dammi una risposta molto dettagliata."
+    });
+    await registerWorker();
+    const sourceWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!sourceWork) throw new Error("Expected source work");
+    await store.startRun(sourceWork.run.id, "mac-mini-phase0", sourceWork.run.leaseToken);
+    const longResponse = `Sintesi breve. ${"Dettaglio verificabile. ".repeat(45)}`.trim();
+    await store.completeRun(sourceWork.run.id, "mac-mini-phase0", {
+      leaseToken: sourceWork.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "long-answer-thread",
+      output: { response: longResponse },
+      errorSummary: null
+    });
+
+    expect(await database.query("SELECT id FROM telegram_outbox WHERE chat_id = 711")).toEqual([]);
+    const publicationWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!publicationWork) throw new Error("Expected Notion publication work");
+    expect(publicationWork.task).toMatchObject({
+      kind: "notion.telegram-response.publish",
+      payload: {
+        response: longResponse,
+        sourceTaskId: sourceWork.task.id,
+        sourceRunId: sourceWork.run.id,
+        telegramChatId: "711"
+      }
+    });
+    const idempotencyKey = String(publicationWork.task.payload.idempotencyKey);
+    const contentHash = String(publicationWork.task.payload.contentHash);
+    await store.startRun(
+      publicationWork.run.id,
+      "mac-mini-phase0",
+      publicationWork.run.leaseToken
+    );
+    expect(await database.query<{ status: string }>(
+      "SELECT status FROM notion_response_publications WHERE publication_task_id = $1",
+      [publicationWork.task.id]
+    )).toEqual([{ status: "creating" }]);
+    await database.query(
+      "UPDATE tasks SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = $1",
+      [publicationWork.task.id]
+    );
+    const recoveredWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!recoveredWork) throw new Error("Expected recovered Notion publication work");
+    expect(recoveredWork).toMatchObject({
+      recovered: true,
+      task: { id: publicationWork.task.id, attemptCount: 2 }
+    });
+    expect(await database.query<{ status: string; last_error_code: string }>(
+      "SELECT status, last_error_code FROM notion_response_publications WHERE publication_task_id = $1",
+      [publicationWork.task.id]
+    )).toEqual([{
+      status: "planned",
+      last_error_code: "notion_publication_outcome_unknown"
+    }]);
+    await store.startRun(recoveredWork.run.id, "mac-mini-phase0", recoveredWork.run.leaseToken);
+
+    const pageId = "66666666-6666-4666-8666-666666666666";
+    const pageUrl = "https://www.notion.so/66666666666646668666666666666666";
+    await store.completeRun(recoveredWork.run.id, "mac-mini-phase0", {
+      leaseToken: recoveredWork.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: null,
+      output: {
+        notionPublication: {
+          status: "created",
+          pageId,
+          pageUrl,
+          title: `[AI UNVALIDATED] Telegram response · ${sourceWork.run.id}`,
+          idempotencyKey,
+          contentHash,
+          createdAt: publicationWork.task.payload.requestedAt,
+          validationState: "ai_generated_unvalidated",
+          recovered: true
+        }
+      },
+      errorSummary: null
+    });
+
+    const publications = await database.query<{
+      status: string;
+      idempotency_key: string;
+      source_task_id: string;
+      source_run_id: string;
+      page_url: string;
+      validation_state: string;
+      last_error_code: string | null;
+    }>("SELECT * FROM notion_response_publications WHERE publication_task_id = $1", [publicationWork.task.id]);
+    expect(publications).toEqual([expect.objectContaining({
+      status: "created",
+      idempotency_key: `telegram:notion-response:${sourceWork.run.id}`,
+      source_task_id: sourceWork.task.id,
+      source_run_id: sourceWork.run.id,
+      page_url: pageUrl,
+      validation_state: "ai_generated_unvalidated",
+      last_error_code: null
+    })]);
+    const messages = await database.query<{ text: string }>(
+      "SELECT text FROM telegram_outbox WHERE chat_id = 711 ORDER BY created_at"
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.text).toContain("sintesi AI non validata");
+    expect(messages[0]?.text).toContain("Sintesi breve.");
+    expect(messages[0]?.text).toContain(pageUrl);
+    expect(messages[0]?.text).not.toBe(longResponse);
+
+    const auditGaps = await database.query(
+      `SELECT aggregate_type, aggregate_id
+       FROM events
+       GROUP BY aggregate_type, aggregate_id
+       HAVING MIN(aggregate_version) <> 1
+          OR MAX(aggregate_version) <> COUNT(*)`
+    );
+    expect(auditGaps).toEqual([]);
+  });
+
+  it("persists Notion publication errors and falls back to the complete Telegram text", async () => {
+    store = new Phase0Store(database, { telegramNotionResponseThreshold: 500 });
+    await store.processTelegramCommand({
+      updateId: 221,
+      chatId: 721,
+      userId: 821,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    await store.processTelegramCommand({
+      updateId: 222,
+      chatId: 721,
+      userId: 821,
+      username: "operator",
+      messageId: 2,
+      action: "ask",
+      pairCodeValid: false,
+      prompt: "Dammi una risposta lunga."
+    });
+    await registerWorker();
+    const sourceWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!sourceWork) throw new Error("Expected source work");
+    await store.startRun(sourceWork.run.id, "mac-mini-phase0", sourceWork.run.leaseToken);
+    const longResponse = `Risposta di fallback. ${"Contenuto completo. ".repeat(45)}`.trim();
+    await store.completeRun(sourceWork.run.id, "mac-mini-phase0", {
+      leaseToken: sourceWork.run.leaseToken,
+      outcome: "succeeded",
+      runtimeThreadId: "fallback-thread",
+      output: { response: longResponse },
+      errorSummary: null
+    });
+
+    const publicationWork = await store.leaseNextTask("mac-mini-phase0", 300);
+    if (!publicationWork) throw new Error("Expected publication work");
+    await store.startRun(publicationWork.run.id, "mac-mini-phase0", publicationWork.run.leaseToken);
+    await store.completeRun(publicationWork.run.id, "mac-mini-phase0", {
+      leaseToken: publicationWork.run.leaseToken,
+      outcome: "failed_terminal",
+      runtimeThreadId: null,
+      output: {
+        notionPublication: {
+          status: "failed",
+          errorCode: "notion_response_publication_not_configured",
+          idempotencyKey: publicationWork.task.payload.idempotencyKey
+        }
+      },
+      errorSummary: "notion_response_publication_not_configured"
+    });
+
+    expect(await database.query<{ status: string; last_error_code: string }>(
+      "SELECT status, last_error_code FROM notion_response_publications WHERE publication_task_id = $1",
+      [publicationWork.task.id]
+    )).toEqual([{
+      status: "failed",
+      last_error_code: "notion_response_publication_not_configured"
+    }]);
+    const messages = await database.query<{ text: string }>(
+      "SELECT text FROM telegram_outbox WHERE chat_id = 721 ORDER BY created_at"
+    );
+    expect(messages.map(({ text }) => text).join("")).toBe(longResponse);
+    const failureEvents = await database.query<{ payload: Record<string, unknown> }>(
+      "SELECT payload FROM events WHERE type = 'notion.response_publication.failed'"
+    );
+    expect(failureEvents).toEqual([{
+      payload: expect.objectContaining({
+        errorCode: "notion_response_publication_not_configured",
+        retryScheduled: false
+      })
+    }]);
   });
 
   it("executes supervisor Notion research and answers follow-up status from durable context", async () => {

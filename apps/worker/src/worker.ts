@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { CodexSdkRuntime, type AgentRuntime } from "@meaworld/codex";
-import { NotionResearchError, researchNotion } from "@meaworld/notion";
+import {
+  NotionResearchError,
+  NotionResponsePublicationError,
+  publishTelegramResponseToNotion,
+  researchNotion
+} from "@meaworld/notion";
 import { log } from "@meaworld/observability";
 import { executeTask } from "@meaworld/orchestration";
 import { WorkerApiClient } from "./client.js";
@@ -125,6 +130,13 @@ export class Phase0Worker {
                 leaseToken: work.run.leaseToken,
                 correlationId
               })
+          : work.task.kind === "notion.telegram-response.publish"
+            ? await this.executeNotionResponsePublication({
+                task: work.task,
+                runId: work.run.id,
+                leaseToken: work.run.leaseToken,
+                correlationId
+              })
           : await executeTask({
               task: work.task,
               runId: work.run.id,
@@ -226,6 +238,97 @@ export class Phase0Worker {
           ? error.code
           : "Notion research collection failed"
       };
+    }
+  }
+
+  private async executeNotionResponsePublication(input: {
+    task: Parameters<typeof executeTask>[0]["task"];
+    runId: string;
+    leaseToken: string;
+    correlationId: string;
+  }): Promise<Awaited<ReturnType<typeof executeTask>>> {
+    const payload = input.task.payload;
+    const idempotencyKey = typeof payload.idempotencyKey === "string"
+      ? payload.idempotencyKey
+      : "notion-publication-invalid";
+    const failure = (
+      errorCode: string,
+      retryable: boolean
+    ): Awaited<ReturnType<typeof executeTask>> => ({
+      outcome: retryable ? "failed_retryable" : "failed_terminal",
+      runtimeThreadId: null,
+      output: {
+        notionPublication: {
+          status: "failed",
+          errorCode,
+          idempotencyKey
+        }
+      },
+      errorSummary: errorCode
+    });
+    if (!this.config.notionToken || !this.config.notionTelegramParentPageId) {
+      return failure("notion_response_publication_not_configured", false);
+    }
+    if (
+      typeof payload.response !== "string"
+      || typeof payload.contentHash !== "string"
+      || typeof payload.sourceTaskId !== "string"
+      || typeof payload.sourceRunId !== "string"
+      || typeof payload.requestedAt !== "string"
+      || typeof payload.idempotencyKey !== "string"
+    ) {
+      return failure("notion_response_publication_invalid", false);
+    }
+
+    try {
+      await this.client.checkpoint(input.runId, input.leaseToken, {
+        stage: "notion_response_publication_starting",
+        idempotencyKey,
+        sourceTaskId: payload.sourceTaskId,
+        sourceRunId: payload.sourceRunId,
+        recordedAt: new Date().toISOString()
+      }, input.correlationId);
+      const published = await publishTelegramResponseToNotion(
+        this.config.notionToken,
+        {
+          parentPageId: this.config.notionTelegramParentPageId,
+          sourceTaskId: payload.sourceTaskId,
+          sourceRunId: payload.sourceRunId,
+          idempotencyKey,
+          createdAt: payload.requestedAt,
+          response: payload.response,
+          contentHash: payload.contentHash
+        }
+      );
+      await this.client.checkpoint(input.runId, input.leaseToken, {
+        stage: "notion_response_publication_created",
+        idempotencyKey,
+        pageId: published.pageId,
+        recovered: published.recovered,
+        recordedAt: new Date().toISOString()
+      }, input.correlationId);
+      return {
+        outcome: "succeeded",
+        runtimeThreadId: null,
+        output: {
+          notionPublication: {
+            status: "created",
+            pageId: published.pageId,
+            pageUrl: published.pageUrl,
+            title: published.title,
+            idempotencyKey,
+            contentHash: payload.contentHash,
+            createdAt: payload.requestedAt,
+            validationState: "ai_generated_unvalidated",
+            recovered: published.recovered
+          }
+        },
+        errorSummary: null
+      };
+    } catch (error) {
+      return error instanceof NotionResponsePublicationError
+        ? failure(error.code, error.retryable)
+        : failure("notion_page_creation_failed", true);
     }
   }
 
