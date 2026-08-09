@@ -148,7 +148,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       }
     }
   } else if ((command.action === "ask" || command.action === "request") && result.task) {
-    reply = `Richiesta acquisita: ${result.task.id}\nTi scriverò automaticamente appena avrò una risposta, una domanda o una conferma da chiederti.`;
+    reply = command.action === "ask"
+      ? `Domanda acquisita: ${result.task.id}\nTi scriverò automaticamente appena la risposta sarà pronta.`
+      : result.task.kind === "notion.research"
+        ? `Il supervisore ha avviato la ricerca Notion: ${result.task.id}\nTi invierà automaticamente la sintesi con fonti, confidenza e copertura misurata.`
+        : `Il supervisore ha preso in carico la richiesta: ${result.task.id}\nEseguirà le azioni read-only supportate, oppure ti chiederà conferma, una decisione o l’accesso mancante.`;
   } else {
     reply = "Comando non riconosciuto. Usa /help.";
   }

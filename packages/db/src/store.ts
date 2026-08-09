@@ -441,6 +441,123 @@ async function enqueueTelegramTextInTransaction(
   }
 }
 
+async function telegramConversationContext(
+  database: Database,
+  chatId: number,
+  limit = 8
+): Promise<Array<Record<string, unknown>>> {
+  const taskRows = await database.query<Row>(
+    `SELECT * FROM tasks
+     WHERE payload->>'source' = 'telegram' AND payload->>'telegramChatId' = $1
+     ORDER BY created_at DESC LIMIT $2`,
+    [String(chatId), Math.max(1, Math.min(limit, 8))]
+  );
+  const context: Array<Record<string, unknown>> = [];
+  for (const taskRow of taskRows) {
+    const task = taskFromRow(taskRow);
+    const runRows = await database.query<Row>(
+      "SELECT * FROM runs WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+      [task.id]
+    );
+    const run = runRows[0] ? runFromRow(runRows[0]) : null;
+    const response = run?.output?.response;
+    context.push({
+      taskId: task.id,
+      kind: task.kind,
+      objective: task.objective,
+      status: task.status,
+      updatedAt: task.updatedAt,
+      ...(typeof task.payload.sourceTaskId === "string"
+        ? { sourceTaskId: task.payload.sourceTaskId }
+        : {}),
+      ...(typeof run?.output?.intent === "string" ? { decisionIntent: run.output.intent } : {}),
+      ...(typeof response === "string" ? { responsePreview: response.slice(0, 600) } : {}),
+      ...(run?.errorSummary ? { errorSummary: run.errorSummary } : {})
+    });
+  }
+  return context;
+}
+
+async function telegramTaskStatusText(
+  database: Database,
+  chatId: number,
+  requestedTaskId: string
+): Promise<string> {
+  const targetRows = await database.query<Row>(
+    `SELECT * FROM tasks
+     WHERE id = $1 AND payload->>'source' = 'telegram' AND payload->>'telegramChatId' = $2
+     LIMIT 1`,
+    [requestedTaskId, String(chatId)]
+  );
+  const target = targetRows[0] ? taskFromRow(targetRows[0]) : null;
+  if (!target) return "Non trovo quella task nella tua conversazione Telegram.";
+
+  const childRows = await database.query<Row>(
+    `SELECT * FROM tasks
+     WHERE payload->>'sourceTaskId' = $1 AND payload->>'telegramChatId' = $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [target.id, String(chatId)]
+  );
+  const effective = childRows[0] ? taskFromRow(childRows[0]) : target;
+  const runRows = await database.query<Row>(
+    "SELECT * FROM runs WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+    [effective.id]
+  );
+  const run = runRows[0] ? runFromRow(runRows[0]) : null;
+  if (["ready", "leased", "running", "waiting_tool", "waiting_human", "verifying"].includes(effective.status)) {
+    return `Non ancora. “${effective.objective}” è ${effective.status}; task ${effective.id}. Ti scriverò automaticamente al completamento.`;
+  }
+  if (["failed_terminal", "cancelled"].includes(effective.status)) {
+    return `No. “${effective.objective}” è ${effective.status}; controlla la dashboard per il tentativo ${run?.id ?? "non disponibile"}.`;
+  }
+  const response = run?.output?.response;
+  if (effective.status === "succeeded" && typeof response === "string") {
+    return `Sì. “${effective.objective}” è completata.\n\n${response}`;
+  }
+  if (effective.status === "succeeded") {
+    return `Sì. “${effective.objective}” è completata; task ${effective.id}.`;
+  }
+  return `La task “${effective.objective}” è ${effective.status}; task ${effective.id}.`;
+}
+
+function explicitNotionResearchQueries(prompt: string): string[] {
+  if (
+    !/\bnotion\b/i.test(prompt)
+    || !/(analizz|cerc|trov|legg|sintet|riassum|informaz|pagin|contenut|confront)/i.test(prompt)
+  ) return [];
+  const ignored = new Set([
+    "notion", "analizza", "analizzare", "cerca", "cercare", "trova", "trovare", "leggi",
+    "sintetizza", "riassumi", "testo", "testi", "informazione", "informazioni", "pagina", "pagine",
+    "considerando", "anche", "tutte", "tutto", "quello", "quella", "quelli", "quelle", "trovi",
+    "parlano", "legato", "legata", "relativo", "relativa", "dimmi", "come", "siamo", "messi",
+    "della", "delle", "degli", "dello", "alla", "alle", "agli", "allo", "nella", "nelle", "negli",
+    "nello", "sulla", "sulle", "sugli", "sullo", "questo", "questa", "questi", "queste", "quando",
+    "dopo", "prima", "senza", "devi", "voglio", "vorrei", "puoi", "puoi", "fammi"
+  ]);
+  const queries: string[] = [];
+  for (const token of prompt.match(/[\p{L}\p{N}][\p{L}\p{N}-]*/gu) ?? []) {
+    const normalized = token.toLocaleLowerCase("it-IT");
+    if (normalized.length < 4 || ignored.has(normalized)) continue;
+    if (queries.some((query) => query.toLocaleLowerCase("it-IT") === normalized)) continue;
+    queries.push(token.slice(0, 200));
+    if (queries.length === 5) break;
+  }
+  return queries;
+}
+
+function explicitTaskStatusTarget(
+  prompt: string,
+  context: Array<Record<string, unknown>>
+): string | null {
+  if (!/(l[’']?hai fatto|lo hai fatto|hai finito|[èe] pront[oa]|finit[oa]|completat|a che punto|come procede|stato (?:della|del) (?:richiesta|task))/i.test(prompt)) {
+    return null;
+  }
+  const candidate = context.find((item) =>
+    item.kind !== "supervisor.status" && typeof item.taskId === "string"
+  );
+  return candidate && typeof candidate.taskId === "string" ? candidate.taskId : null;
+}
+
 export class Phase0Store {
   constructor(private readonly database: Database) {}
 
@@ -559,17 +676,37 @@ export class Phase0Store {
           const objective = routedPrompt.length <= 180
             ? routedPrompt
             : `${routedPrompt.slice(0, 177)}...`;
+          const conversationContext = input.action === "request"
+            ? await telegramConversationContext(transaction, input.chatId)
+            : [];
+          const notionQueries = input.action === "request"
+            ? explicitNotionResearchQueries(routedPrompt)
+            : [];
+          const statusTargetTaskId = input.action === "request" && notionQueries.length === 0
+            ? explicitTaskStatusTarget(routedPrompt, conversationContext)
+            : null;
           task = await enqueueTaskInTransaction(
             transaction,
             {
-              kind: input.action === "ask" ? "operator.query" : "operator.request",
+              kind: input.action === "ask"
+                ? "operator.query"
+                : notionQueries.length > 0
+                  ? "notion.research"
+                  : statusTargetTaskId
+                    ? "supervisor.status"
+                    : "supervisor.request",
               objective,
               payload: {
-                prompt: routedPrompt,
+                ...(notionQueries.length > 0
+                  ? { researchObjective: routedPrompt, searchQueries: notionQueries }
+                  : statusTargetTaskId
+                    ? { targetTaskId: statusTargetTaskId }
+                    : { prompt: routedPrompt }),
                 source: "telegram",
                 sourceUpdateId: input.updateId,
                 telegramChatId: String(input.chatId),
                 telegramUserId: String(input.userId),
+                ...(input.action === "request" ? { conversationContext } : {}),
                 ...(parentRequestId ? { parentTelegramRequestId: parentRequestId } : {})
               },
               dedupeKey: `telegram:update:${input.updateId}`,
@@ -1199,6 +1336,8 @@ export class Phase0Store {
       const runtime = task.kind === "repo.update"
         || task.kind === "operator.query"
         || task.kind === "operator.request"
+        || task.kind === "supervisor.request"
+        || task.kind === "notion.research"
         || task.kind.startsWith("phase0.codex")
         ? "codex-sdk"
         : "deterministic";
@@ -1854,6 +1993,64 @@ export class Phase0Store {
         payload: { errorSummary: completion.errorSummary }
       });
 
+      if (task.kind === "notion.research" && taskStatus === "succeeded") {
+        const sources = asObjectArray(run.output?.sources);
+        let recordedSources = 0;
+        for (const source of sources) {
+          const externalId = typeof source.externalId === "string" ? source.externalId : null;
+          const contentHash = typeof source.contentHash === "string"
+            && /^[a-f0-9]{64}$/.test(source.contentHash)
+            ? source.contentHash
+            : null;
+          if (!externalId || !contentHash) continue;
+          await transaction.query(
+            `INSERT INTO source_objects (
+               source, external_id, object_type, url, last_edited_at, content_hash, metadata
+             ) VALUES ('notion', $1, 'page', $2, $3, $4, ($5::jsonb #>> '{}')::jsonb)
+             ON CONFLICT (source, external_id) DO UPDATE SET
+               object_type = EXCLUDED.object_type,
+               url = EXCLUDED.url,
+               last_edited_at = EXCLUDED.last_edited_at,
+               content_hash = EXCLUDED.content_hash,
+               metadata = EXCLUDED.metadata,
+               last_fetched_at = CURRENT_TIMESTAMP`,
+            [
+              externalId,
+              typeof source.url === "string" ? source.url : null,
+              typeof source.lastEditedAt === "string" ? source.lastEditedAt : null,
+              contentHash,
+              JSON.stringify({
+                title: typeof source.title === "string" ? source.title : "Pagina senza titolo",
+                reference: typeof source.reference === "string" ? source.reference : null,
+                matchedQueries: Array.isArray(source.matchedQueries) ? source.matchedQueries : [],
+                partial: source.partial === true,
+                researchTaskId: task.id,
+                researchRunId: run.id,
+                validationState: run.output?.validationState ?? "ai_generated_unvalidated"
+              })
+            ]
+          );
+          recordedSources += 1;
+        }
+        await appendEvent(transaction, {
+          type: "notion.research.completed",
+          actorType: "worker",
+          actorId: workerId,
+          aggregateType: "notion_research",
+          aggregateId: task.id,
+          aggregateVersion: 1,
+          correlationId,
+          taskId: task.id,
+          runId: run.id,
+          payload: {
+            recordedSources,
+            confidence: run.output?.confidence ?? null,
+            validationState: run.output?.validationState ?? null,
+            coverage: run.output?.coverage ?? null
+          }
+        });
+      }
+
       const taskPayload = asObject(current.task_payload);
       const telegramChatId = taskPayload.source === "telegram"
         ? Number(taskPayload.telegramChatId)
@@ -1869,7 +2066,7 @@ export class Phase0Store {
             runId: run.id,
             correlationId
           });
-        } else if (task.kind === "operator.query") {
+        } else if (task.kind === "operator.query" || task.kind === "notion.research") {
           const response = run.output?.response;
           await enqueueTelegramTextInTransaction(transaction, {
             dedupeKey: `${notificationBase}:answer`,
@@ -1881,13 +2078,96 @@ export class Phase0Store {
             runId: run.id,
             correlationId
           });
-        } else if (task.kind === "operator.request") {
+        } else if (
+          task.kind === "operator.request"
+          || task.kind === "supervisor.request"
+          || task.kind === "supervisor.status"
+        ) {
           const intent = run.output?.intent;
           if (intent === "answer" && typeof run.output?.response === "string") {
             await enqueueTelegramTextInTransaction(transaction, {
               dedupeKey: `${notificationBase}:answer`,
               chatId: telegramChatId,
               text: run.output.response,
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          } else if (
+            intent === "notion_research"
+            && typeof run.output?.objective === "string"
+            && Array.isArray(run.output?.searchQueries)
+            && run.output.searchQueries.every((query) => typeof query === "string")
+          ) {
+            const researchTask = await enqueueTaskInTransaction(
+              transaction,
+              {
+                kind: "notion.research",
+                objective: run.output.objective,
+                payload: {
+                  researchObjective: run.output.objective,
+                  searchQueries: run.output.searchQueries,
+                  source: "telegram",
+                  sourceTaskId: task.id,
+                  telegramChatId: String(telegramChatId),
+                  telegramUserId: String(taskPayload.telegramUserId)
+                },
+                dedupeKey: `telegram:notion-research:${task.id}`,
+                priority: 45,
+                maxAttempts: 3,
+                risk: "low"
+              },
+              {
+                type: "system",
+                id: "supervisor-router",
+                correlationId
+              }
+            );
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:notion-research-started`,
+              chatId: telegramChatId,
+              text: `Avvio ora la ricerca Notion “${researchTask.objective}”. Task: ${researchTask.id}. Ti invierò automaticamente la sintesi con fonti e copertura misurata.`,
+              taskId: researchTask.id,
+              runId: run.id,
+              correlationId
+            });
+          } else if (intent === "task_status" && typeof run.output?.taskId === "string") {
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:task-status`,
+              chatId: telegramChatId,
+              text: await telegramTaskStatusText(transaction, telegramChatId, run.output.taskId),
+              taskId: task.id,
+              runId: run.id,
+              correlationId
+            });
+          } else if (
+            intent === "capability_gap"
+            && typeof run.output?.capability === "string"
+            && typeof run.output?.reason === "string"
+          ) {
+            const dedupeCapability = run.output.capability
+              .toLowerCase()
+              .replace(/[^a-z0-9._-]+/g, "-")
+              .slice(0, 80) || "unknown";
+            await transaction.query(
+              `INSERT INTO capability_requests (
+                 id, dedupe_key, capability, reason, minimum_permission, setup_instructions
+               ) VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (dedupe_key) DO UPDATE SET
+                 reason = EXCLUDED.reason, updated_at = CURRENT_TIMESTAMP`,
+              [
+                randomUUID(),
+                `supervisor:${dedupeCapability}`,
+                run.output.capability,
+                run.output.reason,
+                "Least-privilege access required for the requested operation",
+                "Connect and govern the missing capability before retrying the request."
+              ]
+            );
+            await enqueueTelegramTextInTransaction(transaction, {
+              dedupeKey: `${notificationBase}:capability-gap`,
+              chatId: telegramChatId,
+              text: `Non posso ancora eseguire questa richiesta. Capacità mancante: ${run.output.capability}. ${run.output.reason} Ho registrato il gap nella dashboard.`,
               taskId: task.id,
               runId: run.id,
               correlationId

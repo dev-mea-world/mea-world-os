@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — 2026-08-09
+Superseded in part by ADR 0005 — 2026-08-09
 
 ## Context
 
@@ -12,7 +12,7 @@ Telegram delivery and repository mutation are separate side-effect boundaries. B
 
 ## Decision
 
-- Keep `/ask` as an explicit read-only conversational command. Route free text and `/request` through an `operator.request` task executed read-only and without network access.
+- Keep `/ask` as an explicit read-only conversational command. Route free text and `/request` through an `operator.request` task executed read-only and without network access. ADR 0005 replaces this task with the executable `supervisor.request` contract.
 - Require the router to return one strictly validated decision: answer directly, ask one clarification, or propose a bounded repository update. The router cannot execute the proposed work.
 - Persist clarification and change-request state in PostgreSQL. A reply to a pending clarification is correlated to the original request and routed again.
 - Require the paired Telegram operator to approve or reject every proposed repository update through an inline button. Approval atomically creates one deduplicated `repo.update` task.

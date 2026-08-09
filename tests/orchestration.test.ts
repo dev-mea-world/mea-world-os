@@ -261,6 +261,140 @@ describe("task execution", () => {
     expect(runtime.starts[0]?.prompt).toContain("Migliora il bot");
   });
 
+  it("routes explicit Notion analysis to executable research with durable context", async () => {
+    const runtime = new FakeRuntime(JSON.stringify({
+      intent: "notion_research",
+      objective: "Valutare pipeline, formazione e processi commerciali",
+      searchQueries: ["Pipeline Commerciale", "Formazione commerciale", "Processi commerciali"]
+    }));
+    const result = await executeTask({
+      task: taskWith("supervisor.request", {
+        prompt: "Analizza su Notion la pipeline Commerciale e la formazione.",
+        conversationContext: [{
+          taskId: "11111111-1111-4111-8111-111111111111",
+          kind: "notion.research",
+          status: "running"
+        }]
+      }),
+      runId: "b7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime,
+      workingDirectory: "/tmp/operator-context"
+    });
+
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        intent: "notion_research",
+        searchQueries: ["Pipeline Commerciale", "Formazione commerciale", "Processi commerciali"]
+      }
+    });
+    expect(runtime.starts[0]?.prompt).toContain("Use notion_research whenever");
+    expect(runtime.starts[0]?.prompt).toContain("11111111-1111-4111-8111-111111111111");
+    expect(runtime.starts[0]?.prompt).toContain("A paraphrase, plan, acknowledgement");
+  });
+
+  it("answers deterministic supervisor status tasks without invoking the model", async () => {
+    const runtime = new FakeRuntime("unused");
+    const result = await executeTask({
+      task: taskWith("supervisor.status", {
+        targetTaskId: "11111111-1111-4111-8111-111111111111"
+      }),
+      runId: "e7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime,
+      workingDirectory: "/tmp/operator-context"
+    });
+    expect(result).toEqual({
+      outcome: "succeeded",
+      runtimeThreadId: null,
+      output: {
+        intent: "task_status",
+        taskId: "11111111-1111-4111-8111-111111111111"
+      },
+      errorSummary: null
+    });
+    expect(runtime.starts).toEqual([]);
+  });
+
+  it("synthesizes Notion evidence with validated citations and strips raw source text", async () => {
+    const runtime = new FakeRuntime(JSON.stringify({
+      response: "La pipeline è descritta con una fase di qualificazione [N1]. Risultato AI non validato.",
+      confidence: 0.72
+    }));
+    const result = await executeTask({
+      task: taskWith("notion.research", {
+        researchObjective: "Valuta la pipeline commerciale",
+        searchQueries: ["Pipeline Commerciale"]
+      }),
+      runId: "c7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime,
+      workingDirectory: "/tmp/operator-context",
+      notionResearch: {
+        sources: [{
+          reference: "N1",
+          externalId: "notion-page-1",
+          title: "Pipeline Commerciale",
+          url: "https://notion.so/pipeline",
+          lastEditedAt: "2026-08-08T10:00:00.000Z",
+          contentHash: "a".repeat(64),
+          markdown: "SEGRETO-DI-TEST qualificazione lead",
+          matchedQueries: ["Pipeline Commerciale"],
+          partial: false
+        }],
+        coverage: {
+          requestedQueries: ["Pipeline Commerciale"],
+          searchResultCount: 1,
+          uniquePagesFound: 1,
+          fetchedPages: 1,
+          inaccessiblePages: 0,
+          partial: false,
+          limits: { maxPages: 15, maxCharacters: 60_000 }
+        }
+      }
+    });
+
+    expect(result).toMatchObject({
+      outcome: "succeeded",
+      output: {
+        response: expect.stringContaining("[N1]"),
+        confidence: 0.72,
+        validationState: "ai_generated_unvalidated",
+        sources: [expect.objectContaining({ externalId: "notion-page-1" })]
+      }
+    });
+    expect(JSON.stringify(result.output)).not.toContain("SEGRETO-DI-TEST");
+    expect(runtime.starts[0]).toMatchObject({ sandboxMode: "read-only", networkAccessEnabled: false });
+
+    const invalid = await executeTask({
+      task: taskWith("notion.research", { researchObjective: "Valuta", searchQueries: ["Pipeline"] }),
+      runId: "d7cf35fc-0dd3-4f16-8c2a-c861c6275412",
+      runtime: new FakeRuntime(JSON.stringify({ response: "Fonte inesistente [N2]", confidence: 0.8 })),
+      workingDirectory: "/tmp/operator-context",
+      notionResearch: {
+        sources: [{
+          reference: "N1",
+          externalId: "notion-page-1",
+          title: "Pipeline",
+          url: null,
+          lastEditedAt: null,
+          contentHash: "b".repeat(64),
+          markdown: "contenuto",
+          matchedQueries: ["Pipeline"],
+          partial: false
+        }],
+        coverage: {
+          requestedQueries: ["Pipeline"],
+          searchResultCount: 1,
+          uniquePagesFound: 1,
+          fetchedPages: 1,
+          inaccessiblePages: 0,
+          partial: false,
+          limits: { maxPages: 15, maxCharacters: 60_000 }
+        }
+      }
+    });
+    expect(invalid.outcome).toBe("failed_retryable");
+  });
+
   it("fails closed when Telegram request routing returns non-JSON or extra fields", async () => {
     for (const response of [
       "I would change the repository",
