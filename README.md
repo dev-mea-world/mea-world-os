@@ -55,3 +55,9 @@ The detailed acceptance matrix and current evidence live in [`docs/phase0/PLAN.m
 Deploy `apps/web` to Vercel with the same server-side secrets and a production PostgreSQL URL. Never expose `WORKER_SECRET`, `SESSION_SECRET`, `DASHBOARD_ACCESS_CODE`, or `NOTION_TOKEN` through `NEXT_PUBLIC_*` variables. After deployment, set `WORKER_BASE_URL` on the Mac to the HTTPS deployment URL and verify that its heartbeat is visible.
 
 The launchd template is installed explicitly with `scripts/install-launchd.sh`; it is not installed automatically by repository setup. The installer captures the current Node/pnpm runtime path so the service does not depend on an interactive shell profile.
+
+## Telegram operator channel
+
+The production dashboard exposes `/api/telegram/webhook` as a bounded operator channel. Configure `TELEGRAM_WEBHOOK_SECRET` and `TELEGRAM_PAIRING_CODE` as sensitive production variables, deploy, then register the HTTPS webhook with Telegram using the same webhook secret. The bot token is needed only for Telegram administration and must not be committed or stored in PostgreSQL.
+
+Only one private chat can be paired. Send `/pair <code>` once, then use `/status`, `/tasks`, `/result [task-id]`, `/ask <question>`, or plain text. Questions become durable `operator.query` tasks and execute locally through Codex in read-only mode with network and side effects disabled. Results are visible in the live dashboard and through `/result`.

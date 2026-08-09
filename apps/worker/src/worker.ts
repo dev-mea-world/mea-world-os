@@ -65,6 +65,7 @@ export class Phase0Worker {
     this.activeRunId = work.run.id;
     const correlationId = randomUUID();
     try {
+      await this.heartbeat();
       log({
         level: "info",
         event: work.recovered ? "worker.task_recovered" : "worker.task_leased",
@@ -146,6 +147,13 @@ export class Phase0Worker {
       return true;
     } finally {
       this.activeRunId = null;
+      await this.heartbeat().catch((error: unknown) => {
+        log({
+          level: "error",
+          event: "worker.heartbeat_failed",
+          message: error instanceof Error ? error.message : "Unknown worker heartbeat error"
+        });
+      });
     }
   }
 

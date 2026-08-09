@@ -75,7 +75,8 @@ describe("Phase 0 durable store", () => {
     expect(rerun.applied).toEqual([]);
     expect(rerun.alreadyApplied).toEqual([
       "0001_phase0.sql",
-      "0002_git_publications.sql"
+      "0002_git_publications.sql",
+      "0003_telegram_operator.sql"
     ]);
 
     const constraints = await database.query<{ count: number }>(
@@ -118,6 +119,110 @@ describe("Phase 0 durable store", () => {
     await expect(store.recordHeartbeat(payload)).rejects.toMatchObject({
       code: "heartbeat_out_of_order"
     });
+  });
+
+  it("pairs one Telegram operator, deduplicates updates, and enqueues audited queries", async () => {
+    const invalidPair = await store.processTelegramCommand({
+      updateId: 1,
+      chatId: 101,
+      userId: 202,
+      username: "operator",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: false,
+      prompt: null
+    });
+    expect(invalidPair).toMatchObject({
+      duplicate: false,
+      authorized: false,
+      paired: false,
+      reason: "invalid_pairing_code"
+    });
+
+    const paired = await store.processTelegramCommand({
+      updateId: 2,
+      chatId: 101,
+      userId: 202,
+      username: "operator",
+      messageId: 2,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    expect(paired).toMatchObject({
+      duplicate: false,
+      authorized: true,
+      paired: true,
+      reason: "ok"
+    });
+
+    const deniedSecondOperator = await store.processTelegramCommand({
+      updateId: 3,
+      chatId: 303,
+      userId: 404,
+      username: "intruder",
+      messageId: 1,
+      action: "pair",
+      pairCodeValid: true,
+      prompt: null
+    });
+    expect(deniedSecondOperator.reason).toBe("already_paired");
+
+    const queued = await store.processTelegramCommand({
+      updateId: 4,
+      chatId: 101,
+      userId: 202,
+      username: "operator",
+      messageId: 3,
+      action: "ask",
+      pairCodeValid: false,
+      prompt: "Spiegami lo stato del progetto."
+    });
+    expect(queued.task).toMatchObject({
+      kind: "operator.query",
+      status: "ready",
+      risk: "low",
+      maxAttempts: 2
+    });
+    expect(queued.task?.payload).toMatchObject({
+      source: "telegram",
+      telegramChatId: "101",
+      telegramUserId: "202"
+    });
+
+    const duplicate = await store.processTelegramCommand({
+      updateId: 4,
+      chatId: 101,
+      userId: 202,
+      username: "operator",
+      messageId: 3,
+      action: "ask",
+      pairCodeValid: false,
+      prompt: "Non deve essere accodata due volte."
+    });
+    expect(duplicate.duplicate).toBe(true);
+    expect(await store.telegramTasks(101)).toHaveLength(1);
+
+    const taskRows = await database.query<{ count: number }>(
+      "SELECT COUNT(*)::integer AS count FROM tasks WHERE dedupe_key = 'telegram:update:4'"
+    );
+    expect(taskRows[0]?.count).toBe(1);
+    const auditGaps = await database.query(
+      `SELECT aggregate_type, aggregate_id
+       FROM events
+       GROUP BY aggregate_type, aggregate_id
+       HAVING MIN(aggregate_version) <> 1
+          OR MAX(aggregate_version) <> COUNT(*)`
+    );
+    expect(auditGaps).toEqual([]);
+
+    const snapshot = await store.dashboardSnapshot();
+    expect(snapshot.telegram).toMatchObject({
+      paired: true,
+      lastCommand: "ask",
+      lastTaskId: queued.task?.id
+    });
+    expect(snapshot.events.some((event) => event.type === "worker.heartbeat")).toBe(false);
   });
 
   it("leases once under contention and recovers an expired in-flight run", async () => {

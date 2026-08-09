@@ -258,56 +258,243 @@ export interface NotionSampleInput {
   errorCode: string | null;
 }
 
+interface TaskEnqueueInput {
+  kind: string;
+  objective: string;
+  payload: Record<string, unknown>;
+  dedupeKey: string;
+  priority?: number;
+  maxAttempts?: number;
+  risk?: "low" | "medium" | "high";
+}
+
+interface TaskEnqueueActor {
+  type: string;
+  id: string;
+  correlationId: string;
+}
+
+export type TelegramCommandAction =
+  | "pair"
+  | "help"
+  | "status"
+  | "tasks"
+  | "result"
+  | "ask"
+  | "unknown";
+
+export interface TelegramCommandInput {
+  updateId: number;
+  chatId: number;
+  userId: number;
+  username: string | null;
+  messageId: number;
+  action: TelegramCommandAction;
+  pairCodeValid: boolean;
+  prompt: string | null;
+}
+
+export interface TelegramCommandResult {
+  duplicate: boolean;
+  authorized: boolean;
+  paired: boolean;
+  reason: "ok" | "not_paired" | "invalid_pairing_code" | "already_paired" | "invalid_prompt";
+  task: TaskRecord | null;
+}
+
+export interface TelegramTaskView {
+  task: TaskRecord;
+  latestRun: RunRecord | null;
+}
+
+async function enqueueTaskInTransaction(
+  database: Database,
+  input: TaskEnqueueInput,
+  actor: TaskEnqueueActor
+): Promise<TaskRecord> {
+  const existing = await database.query<Row>(
+    "SELECT * FROM tasks WHERE dedupe_key = $1 FOR UPDATE",
+    [input.dedupeKey]
+  );
+  if (existing[0]) return taskFromRow(existing[0]);
+
+  const id = randomUUID();
+  const inserted = await database.query<Row>(
+    `INSERT INTO tasks (
+       id, kind, objective, status, priority, risk, payload, dedupe_key, max_attempts
+     ) VALUES ($1, $2, $3, 'ready', $4, $5, ($6::jsonb #>> '{}')::jsonb, $7, $8)
+     RETURNING *`,
+    [
+      id,
+      input.kind,
+      input.objective,
+      input.priority ?? 0,
+      input.risk ?? "low",
+      JSON.stringify(input.payload),
+      input.dedupeKey,
+      input.maxAttempts ?? 3
+    ]
+  );
+  const task = taskFromRow(inserted[0] ?? {});
+  await appendEvent(database, {
+    type: "task.created",
+    actorType: actor.type,
+    actorId: actor.id,
+    aggregateType: "task",
+    aggregateId: id,
+    aggregateVersion: 1,
+    correlationId: actor.correlationId,
+    taskId: id,
+    payload: { kind: input.kind, dedupeKey: input.dedupeKey }
+  });
+  return task;
+}
+
 export class Phase0Store {
   constructor(private readonly database: Database) {}
 
-  async enqueueTask(input: {
-    kind: string;
-    objective: string;
-    payload: Record<string, unknown>;
-    dedupeKey: string;
-    priority?: number;
-    maxAttempts?: number;
-    risk?: "low" | "medium" | "high";
-  }): Promise<TaskRecord> {
-    return this.database.transaction(async (transaction) => {
-      const existing = await transaction.query<Row>(
-        "SELECT * FROM tasks WHERE dedupe_key = $1 FOR UPDATE",
-        [input.dedupeKey]
-      );
-      if (existing[0]) return taskFromRow(existing[0]);
+  async enqueueTask(input: TaskEnqueueInput): Promise<TaskRecord> {
+    return this.database.transaction((transaction) => enqueueTaskInTransaction(
+      transaction,
+      input,
+      { type: "system", id: "task-enqueuer", correlationId: randomUUID() }
+    ));
+  }
 
-      const id = randomUUID();
-      const inserted = await transaction.query<Row>(
-        `INSERT INTO tasks (
-           id, kind, objective, status, priority, risk, payload, dedupe_key, max_attempts
-         ) VALUES ($1, $2, $3, 'ready', $4, $5, ($6::jsonb #>> '{}')::jsonb, $7, $8)
-         RETURNING *`,
-        [
-          id,
-          input.kind,
-          input.objective,
-          input.priority ?? 0,
-          input.risk ?? "low",
-          JSON.stringify(input.payload),
-          input.dedupeKey,
-          input.maxAttempts ?? 3
-        ]
+  async processTelegramCommand(input: TelegramCommandInput): Promise<TelegramCommandResult> {
+    return this.database.transaction(async (transaction) => {
+      const duplicate = await transaction.query<Row>(
+        "SELECT task_id FROM telegram_updates WHERE update_id = $1",
+        [input.updateId]
       );
-      const task = taskFromRow(inserted[0] ?? {});
+      if (duplicate[0]) {
+        return {
+          duplicate: true,
+          authorized: false,
+          paired: false,
+          reason: "ok",
+          task: null
+        };
+      }
+
+      const operatorRows = await transaction.query<Row>(
+        "SELECT * FROM telegram_operator WHERE singleton = true FOR UPDATE"
+      );
+      const operator = operatorRows[0];
+      let authorized = Boolean(
+        operator
+        && !operator.revoked_at
+        && asNumber(operator.chat_id) === input.chatId
+        && asNumber(operator.user_id) === input.userId
+      );
+      let paired = false;
+      let reason: TelegramCommandResult["reason"] = "ok";
+      let status: "processed" | "rejected" | "ignored" = "processed";
+      let task: TaskRecord | null = null;
+      const correlationId = randomUUID();
+
+      if (input.action === "pair") {
+        if (!input.pairCodeValid) {
+          reason = "invalid_pairing_code";
+          status = "rejected";
+        } else if (!operator) {
+          await transaction.query(
+            `INSERT INTO telegram_operator (singleton, chat_id, user_id, username)
+             VALUES (true, $1, $2, $3)`,
+            [input.chatId, input.userId, input.username]
+          );
+          await appendEvent(transaction, {
+            type: "telegram.operator_paired",
+            actorType: "human",
+            actorId: `telegram:${input.userId}`,
+            aggregateType: "telegram_operator",
+            aggregateId: "primary",
+            aggregateVersion: 1,
+            correlationId,
+            payload: { chatType: "private" }
+          });
+          authorized = true;
+          paired = true;
+        } else if (!authorized) {
+          reason = "already_paired";
+          status = "rejected";
+        }
+      } else if (!authorized) {
+        reason = "not_paired";
+        status = input.action === "help" ? "ignored" : "rejected";
+      } else if (input.action === "ask") {
+        const prompt = input.prompt?.trim();
+        if (!prompt || prompt.length > 4_000) {
+          reason = "invalid_prompt";
+          status = "rejected";
+        } else {
+          const objective = prompt.length <= 180 ? prompt : `${prompt.slice(0, 177)}...`;
+          task = await enqueueTaskInTransaction(
+            transaction,
+            {
+              kind: "operator.query",
+              objective,
+              payload: {
+                prompt,
+                source: "telegram",
+                sourceUpdateId: input.updateId,
+                telegramChatId: String(input.chatId),
+                telegramUserId: String(input.userId)
+              },
+              dedupeKey: `telegram:update:${input.updateId}`,
+              priority: 40,
+              maxAttempts: 2,
+              risk: "low"
+            },
+            {
+              type: "human",
+              id: `telegram:${input.userId}`,
+              correlationId
+            }
+          );
+        }
+      }
+
+      await transaction.query(
+        `INSERT INTO telegram_updates (
+           update_id, chat_id, user_id, message_id, command, status, task_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [input.updateId, input.chatId, input.userId, input.messageId, input.action, status, task?.id ?? null]
+      );
       await appendEvent(transaction, {
-        type: "task.created",
-        actorType: "system",
-        actorId: "task-enqueuer",
-        aggregateType: "task",
-        aggregateId: id,
+        type: `telegram.update_${status}`,
+        actorType: authorized ? "human" : "external",
+        actorId: authorized ? `telegram:${input.userId}` : "telegram:unpaired",
+        aggregateType: "telegram_update",
+        aggregateId: String(input.updateId),
         aggregateVersion: 1,
-        correlationId: randomUUID(),
-        taskId: id,
-        payload: { kind: input.kind, dedupeKey: input.dedupeKey }
+        correlationId,
+        taskId: task?.id ?? null,
+        payload: { command: input.action, reason }
       });
-      return task;
+
+      return { duplicate: false, authorized, paired, reason, task };
     });
+  }
+
+  async telegramTasks(chatId: number, requestedTaskId?: string, limit = 5): Promise<TelegramTaskView[]> {
+    const rows = await this.database.query<Row>(
+      `SELECT * FROM tasks
+       WHERE payload->>'source' = 'telegram'
+         AND payload->>'telegramChatId' = $1
+         AND ($2::text IS NULL OR id::text = $2)
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [String(chatId), requestedTaskId ?? null, Math.max(1, Math.min(limit, 10))]
+    );
+    return Promise.all(rows.map(async (row) => {
+      const task = taskFromRow(row);
+      const runRows = await this.database.query<Row>(
+        "SELECT * FROM runs WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+        [task.id]
+      );
+      return { task, latestRun: runRows[0] ? runFromRow(runRows[0]) : null };
+    }));
   }
 
   async checkLoginRateLimit(fingerprintValue: string): Promise<RateLimitState> {
@@ -604,7 +791,9 @@ export class Phase0Store {
         [candidate.id, workerId, leaseToken, leaseSeconds]
       );
       const task = taskFromRow(updatedTasks[0] ?? {});
-      const runtime = task.kind === "repo.update" || task.kind.startsWith("phase0.codex")
+      const runtime = task.kind === "repo.update"
+        || task.kind === "operator.query"
+        || task.kind.startsWith("phase0.codex")
         ? "codex-sdk"
         : "deterministic";
       const insertedRuns = await transaction.query<Row>(
@@ -1525,7 +1714,7 @@ export class Phase0Store {
   }
 
   async dashboardSnapshot(): Promise<DashboardSnapshot> {
-    const [workers, tasks, runs, proposals, events, notionRuns] = await Promise.all([
+    const [workers, tasks, runs, proposals, events, notionRuns, telegramOperators, telegramUpdates] = await Promise.all([
       this.database.query<Row>(
         `SELECT *, CASE
            WHEN revoked_at IS NOT NULL THEN 'revoked'
@@ -1537,8 +1726,16 @@ export class Phase0Store {
       this.database.query<Row>("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 10"),
       this.database.query<Row>("SELECT * FROM runs ORDER BY created_at DESC LIMIT 10"),
       this.database.query<Row>("SELECT * FROM proposals ORDER BY created_at DESC LIMIT 10"),
-      this.database.query<Row>("SELECT * FROM events ORDER BY occurred_at DESC LIMIT 30"),
-      this.database.query<Row>("SELECT * FROM notion_sample_runs ORDER BY sampled_at DESC LIMIT 1")
+      this.database.query<Row>(
+        "SELECT * FROM events WHERE type <> 'worker.heartbeat' ORDER BY occurred_at DESC LIMIT 30"
+      ),
+      this.database.query<Row>("SELECT * FROM notion_sample_runs ORDER BY sampled_at DESC LIMIT 1"),
+      this.database.query<Row>(
+        "SELECT * FROM telegram_operator WHERE singleton = true AND revoked_at IS NULL LIMIT 1"
+      ),
+      this.database.query<Row>(
+        "SELECT * FROM telegram_updates ORDER BY created_at DESC, update_id DESC LIMIT 1"
+      )
     ]);
     const worker = workers[0] ? workerFromRow(workers[0]) : null;
     const notionRow = notionRuns[0];
@@ -1557,6 +1754,7 @@ export class Phase0Store {
           sampledAt: null,
           errorCode: null
         };
+    const telegramUpdate = telegramUpdates[0];
 
     return {
       generatedAt: new Date().toISOString(),
@@ -1566,7 +1764,13 @@ export class Phase0Store {
       runs: runs.map(runFromRow),
       proposals: proposals.map(proposalFromRow),
       events: events.map(eventFromRow),
-      notion
+      notion,
+      telegram: {
+        paired: telegramOperators.length > 0,
+        lastUpdateAt: telegramUpdate ? asString(telegramUpdate.created_at) : null,
+        lastCommand: telegramUpdate ? asString(telegramUpdate.command) : null,
+        lastTaskId: telegramUpdate ? asNullableString(telegramUpdate.task_id) : null
+      }
     };
   }
 }

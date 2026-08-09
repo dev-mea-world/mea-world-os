@@ -73,6 +73,25 @@ export const ProposalDecisionSchema = z.object({
   reason: z.string().trim().max(1_000).default("")
 });
 
+const TelegramIdentifierSchema = z.number().int().safe();
+
+export const TelegramUpdateSchema = z.object({
+  update_id: TelegramIdentifierSchema.nonnegative(),
+  message: z.object({
+    message_id: TelegramIdentifierSchema.nonnegative(),
+    from: z.object({
+      id: TelegramIdentifierSchema,
+      is_bot: z.boolean(),
+      username: z.string().max(64).optional()
+    }).passthrough(),
+    chat: z.object({
+      id: TelegramIdentifierSchema,
+      type: z.string()
+    }).passthrough(),
+    text: z.string().max(4_096).optional()
+  }).passthrough().optional()
+}).passthrough();
+
 export const gitPublicationStages = [
   "planned",
   "committed",
@@ -144,6 +163,7 @@ export type RunStart = z.infer<typeof RunStartSchema>;
 export type RunCheckpoint = z.infer<typeof RunCheckpointSchema>;
 export type RunRenew = z.infer<typeof RunRenewSchema>;
 export type RunComplete = z.infer<typeof RunCompleteSchema>;
+export type TelegramUpdate = z.infer<typeof TelegramUpdateSchema>;
 export type GitPublicationStage = (typeof gitPublicationStages)[number];
 export type GitPublicationCommand = z.infer<typeof GitPublicationCommandSchema>;
 
@@ -260,6 +280,13 @@ export interface NotionSampleSummary {
   errorCode: string | null;
 }
 
+export interface TelegramSummary {
+  paired: boolean;
+  lastUpdateAt: string | null;
+  lastCommand: string | null;
+  lastTaskId: string | null;
+}
+
 export interface DashboardSnapshot {
   generatedAt: string;
   systemStatus: "running" | "degraded";
@@ -269,4 +296,5 @@ export interface DashboardSnapshot {
   proposals: ProposalRecord[];
   events: EventRecord[];
   notion: NotionSampleSummary;
+  telegram: TelegramSummary;
 }
